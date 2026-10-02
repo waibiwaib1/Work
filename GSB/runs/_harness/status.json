@@ -1,0 +1,21 @@
+{
+  "updated_at": "2026-10-02T23:47:41Z",
+  "tasks": {
+    "rust-analyzer__rust-analyzer-4043": {
+      "phase": "failed",
+      "status": "failed",
+      "started_at": "2026-10-02T22:20:22Z",
+      "ended_at": "2026-10-02T22:30:53Z",
+      "duration_seconds": 630.7,
+      "uploaded": false,
+      "uploaded_at": null,
+      "error": "a codex exit 1: 6,764",
+      "a": "fail",
+      "b": "done",
+      "video_a": "",
+      "s3_a": "done",
+      "video_b": "done",
+      "s3_b": "done"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "rust-analyzer__rust-analyzer-4043": {
+    "image_name": "docker.io/swerebenchv2/rust-analyzer-rust-analyzer:4043-e99447f",
+    "test_cmd": "cargo test -- --nocapture",
+    "language": "rust"
+  }
+}

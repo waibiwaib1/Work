@@ -1,2 +1,10 @@
 *.md
+config.json
 codex-linux/
+__pycache__/
+*.pyc
+logs/
+*.log
+task/
+runs/*
+!runs/_harness/
