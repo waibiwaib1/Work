@@ -221,15 +221,59 @@ def image_release(image: str, remove: bool) -> None:
         print(f"image remove failed {image}: {detail}", flush=True)
 
 
+def side_codex_home(instance_id: str, side: str) -> Path:
+    return WORK / instance_id / f".codex-{side}"
+
+
+def prepare_codex_home(instance_id: str, side: str) -> Path:
+    """Private Codex home so parallel containers never share config.toml."""
+    home = side_codex_home(instance_id, side)
+    home.mkdir(parents=True, exist_ok=True)
+    base_url = relay.proxy_base(instance_id, side)
+    (home / "config.toml").write_text(
+        "\n".join(
+            [
+                f'model_provider = "{MODEL_PROVIDER}"',
+                f'model = "{MODEL}"',
+                f"model_context_window = {EXPECTED_WINDOW}",
+                "model_auto_compact_token_limit = 950000",
+                'model_instructions_file = "/root/.codex/relay_base_instructions.txt"',
+                'model_catalog_json = "/root/.codex/relay_model_catalog.json"',
+                "",
+                f"[model_providers.{MODEL_PROVIDER}]",
+                'name = "OpenAI"',
+                f'base_url = "{base_url}"',
+                'wire_api = "responses"',
+                'env_key = "SUPER_RELAY_KEY"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    for filename in ("relay_base_instructions.txt", "relay_model_catalog.json", "auth.json"):
+        source = CODEX_HOME / filename
+        if source.is_file():
+            shutil.copy2(source, home / filename)
+    auth = home / "auth.json"
+    if not auth.is_file():
+        auth.write_text('{"OPENAI_API_KEY":"sk-placeholder"}\n', encoding="utf-8")
+    return home
+
+
 def run_codex(instance_id: str, side: str, image: str, prompt: str, log_path: Path) -> int:
     work_dir = WORK / instance_id / side
     container_dir = f"/work/{instance_id}/{side}"
+    codex_home = prepare_codex_home(instance_id, side)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     script = (
         "export PATH=/opt/gsb-codex/bin:$PATH; "
         "exec codex exec --dangerously-bypass-approvals-and-sandbox "
         f"--config model_provider={MODEL_PROVIDER} --model {MODEL} "
-        f"--config model_providers.super_relay.base_url={relay.proxy_base(instance_id, side)} "
+        f"--config model_providers.{MODEL_PROVIDER}.name=OpenAI "
+        f"--config model_providers.{MODEL_PROVIDER}.base_url={relay.proxy_base(instance_id, side)} "
+        f"--config model_providers.{MODEL_PROVIDER}.wire_api=responses "
+        f"--config model_providers.{MODEL_PROVIDER}.env_key=SUPER_RELAY_KEY "
+        f"--config model_context_window={EXPECTED_WINDOW} "
         "--config model_instructions_file=/root/.codex/relay_base_instructions.txt "
         "--config model_catalog_json=/root/.codex/relay_model_catalog.json"
     )
@@ -245,7 +289,7 @@ def run_codex(instance_id: str, side: str, image: str, prompt: str, log_path: Pa
         "-v",
         f"{work_dir}:{container_dir}",
         "-v",
-        f"{CODEX_HOME}:/root/.codex",
+        f"{codex_home}:/root/.codex",
         "-e",
         "SUPER_RELAY_KEY",
         "--add-host",
@@ -300,7 +344,7 @@ def parse_rollout(path: Path) -> tuple[str | None, str | None, int | None]:
 
 def collect_rollout(instance_id: str, side: str, started: float, ended: float) -> dict:
     expected_cwd = f"/work/{instance_id}/{side}"
-    sessions = CODEX_HOME / "sessions"
+    sessions = side_codex_home(instance_id, side) / "sessions"
     matches: list[tuple[float, Path]] = []
     for path in sessions.rglob("rollout-*.jsonl"):
         modified = path.stat().st_mtime
