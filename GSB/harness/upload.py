@@ -11,7 +11,7 @@ from urllib.parse import quote, unquote, urlparse
 import boto3
 
 from paths import ROOT, RUNS, S3_BUCKET, S3_REGION
-from records import build_sheet_row, load_task, store_side, update_status, upsert_sheet_row
+from records import load_task, store_side, update_status
 from runtime import side_branch
 
 CONFIG_PATH = ROOT / "config.json"
@@ -140,10 +140,6 @@ def upload_task(instance_id: str) -> int:
         stored.update(info)
         store_side(instance_id, side, stored)
         update_status(instance_id, **{f"s3_{side}": "done"})
-    try:
-        upsert_sheet_row(build_sheet_row({"instance_id": instance_id}))
-    except PermissionError:
-        print("sheet is open, left the S3 urls in task.json only")
     return 1 if failed else 0
 
 

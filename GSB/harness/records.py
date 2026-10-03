@@ -1,17 +1,15 @@
-"""Status ledger, task records, the sheet, and the status table."""
+"""Status ledger, task records, and the status table."""
 
 from __future__ import annotations
 
-import csv
 import json
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from paths import CANDIDATES, CATALOG, HARNESS_STATE, RUNS, SHEET, SHEET_COLUMNS, SOURCE, snapshot_url
+from paths import CANDIDATES, CATALOG, HARNESS_STATE, RUNS, SOURCE
 
 _state_lock = threading.Lock()
-_sheet_lock = threading.Lock()
 _task_lock = threading.Lock()
 
 
@@ -171,63 +169,6 @@ def task_type_from_categories(categories: list[str] | None) -> str:
     return ""
 
 
-def blank_sheet_row() -> dict[str, str]:
-    return {column: "" for column in SHEET_COLUMNS}
-
-
-def read_sheet_rows() -> list[dict[str, str]]:
-    if not SHEET.exists():
-        return []
-    with SHEET.open(encoding="utf-8-sig", newline="") as handle:
-        return [{column: (row.get(column) or "") for column in SHEET_COLUMNS} for row in csv.DictReader(handle)]
-
-
-def write_sheet_rows(rows: list[dict[str, str]]) -> None:
-    SHEET.parent.mkdir(parents=True, exist_ok=True)
-    with SHEET.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SHEET_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def build_sheet_row(row: dict) -> dict[str, str]:
-    instance_id = row["instance_id"]
-    task = load_task(instance_id)
-    sheet = blank_sheet_row()
-    sheet["instance_id"] = instance_id
-    sheet["User Prompt"] = task.get("problem_statement") or row.get("problem_statement") or ""
-    sheet["任务类型"] = task.get("task_type") or task_type_from_categories(row.get("pr_categories"))
-    sheet["任务难度"] = task.get("difficulty") or "困难"
-    sheet["语言框架"] = task.get("language") or row.get("language") or ""
-    sheet["操作系统"] = task.get("os") or "Windows"
-    sheet["环境可复现等级"] = task.get("repro_level") or "已容器化，可一键起环境"
-    sheet["Harness"] = "Codex CLI"
-    sheet["初始环境快照"] = task.get("base_commit") or row.get("base_commit") or ""
-    for side, prefix in (("a", "A"), ("b", "B")):
-        info = (task.get("sides") or {}).get(side) or {}
-        sheet[f"{prefix}-SessionID"] = info.get("session_id") or ""
-        sheet[f"{prefix}-轨迹文件"] = info.get("s3_rollout") or info.get("rollout_file") or ""
-        sheet[f"{prefix}-产物快照"] = info.get("permalink") or snapshot_url(info.get("head") or "")
-        sheet[f"{prefix}-运行录屏"] = info.get("s3_url") or ""
-    sheet["A-交付完整性（1-5）"] = "" if task.get("delivery_a") is None else str(task.get("delivery_a"))
-    sheet["B-交付完整性（1-5）"] = "" if task.get("delivery_b") is None else str(task.get("delivery_b"))
-    sheet["GSB 结论"] = task.get("gsb") or ""
-    sheet["GSB 理由"] = task.get("gsb_reason") or ""
-    return sheet
-
-
-def upsert_sheet_row(sheet: dict[str, str]) -> None:
-    with _sheet_lock:
-        rows = read_sheet_rows()
-        for index, existing in enumerate(rows):
-            if existing.get("instance_id") == sheet["instance_id"]:
-                rows[index] = sheet
-                break
-        else:
-            rows.append(sheet)
-        write_sheet_rows(rows)
-
-
 def display_width(text: str) -> int:
     return sum(2 if ord(ch) > 0x2E80 else 1 for ch in text)
 
@@ -245,6 +186,20 @@ def format_elapsed(seconds: float) -> str:
     return f"{minutes}m{secs:02d}s"
 
 
+CHINA = timezone(timedelta(hours=8))
+
+
+def task_started(task: dict) -> str:
+    started = task.get("started_at")
+    if not started:
+        return "-"
+    try:
+        start = datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return "-"
+    return start.astimezone(CHINA).strftime("%m-%d %H:%M:%S")
+
+
 def task_elapsed(task: dict) -> str:
     if task.get("status") != "running" and task.get("duration_seconds") is not None:
         return format_elapsed(float(task["duration_seconds"]))
@@ -256,17 +211,6 @@ def task_elapsed(task: dict) -> str:
     except ValueError:
         return "-"
     return format_elapsed((datetime.now(timezone.utc) - start).total_seconds())
-
-
-def task_label(task: dict) -> str:
-    if task.get("status") == "running":
-        phase = str(task.get("phase") or "running")
-        if phase == "preparing":
-            return "prep"
-        if phase.startswith("running"):
-            return "run"
-        return phase
-    return {"success": "ok", "failed": "fail"}.get(task_outcome(task), task_outcome(task) or "-")
 
 
 def load_activity() -> dict:
@@ -347,28 +291,49 @@ def render_status() -> str:
         return "reading status...\n"
     tasks = state.get("tasks") or {}
     activity = load_activity()
-    order = {"run": 0, "prep": 1, "fail": 2, "ok": 3}
-    rows = sorted(tasks.items(), key=lambda item: (order.get(task_label(item[1]), 9), item[0]))
-    id_width = max([4, *(len(instance_id) for instance_id in tasks)], default=4)
-    rendered = []
-    for instance_id, task in rows:
-        rendered.append(
-            (
-                instance_id,
-                side_label(task, "a", activity.get(instance_id)),
-                side_label(task, "b", activity.get(instance_id)),
-                task_elapsed(task),
-                short_error(task),
-            )
+    running = []
+    failed = []
+    success = 0
+    pending_upload = 0
+    for instance_id, task in tasks.items():
+        outcome = task_outcome(task)
+        if outcome == "running":
+            running.append((instance_id, task))
+        elif outcome == "failed":
+            failed.append((instance_id, task))
+        elif outcome == "success":
+            success += 1
+            if not task.get("uploaded"):
+                pending_upload += 1
+    running.sort(key=lambda item: (item[1].get("started_at") or "", item[0]), reverse=True)
+    failed.sort(key=lambda item: (item[1].get("started_at") or "", item[0]), reverse=True)
+    shown = running + failed
+    rendered = [
+        (
+            instance_id,
+            side_label(task, "a", activity.get(instance_id)),
+            side_label(task, "b", activity.get(instance_id)),
+            task_started(task),
+            task_elapsed(task),
+            short_error(task),
         )
+        for instance_id, task in shown
+    ]
+    id_width = max([4, *(len(item[0]) for item in rendered)], default=4)
     a_width = max([1, *(len(item[1]) for item in rendered)], default=1)
     b_width = max([1, *(len(item[2]) for item in rendered)], default=1)
-    time_width = max([4, *(len(item[3]) for item in rendered)], default=4)
-    header = f"  {pad('task', id_width)}  {pad('A', a_width)}  {pad('B', b_width)}  {pad('time', time_width)}  error\n"
-    if not rendered:
+    start_width = max([5, *(len(item[3]) for item in rendered)], default=5)
+    time_width = max([4, *(len(item[4]) for item in rendered)], default=4)
+    header = (
+        f"  running {len(running)}  success {success}  failed {len(failed)}  pending upload {pending_upload}\n"
+        f"  {pad('task', id_width)}  {pad('A', a_width)}  {pad('B', b_width)}  {pad('start', start_width)}  {pad('time', time_width)}  error\n"
+    )
+    if not tasks:
         return header + "  no tasks\n"
+    if not rendered:
+        return header + "  no running tasks\n"
     lines = [
-        f"  {pad(instance_id, id_width)}  {pad(side_a, a_width)}  {pad(side_b, b_width)}  {pad(elapsed, time_width)}  {error}".rstrip()
-        for instance_id, side_a, side_b, elapsed, error in rendered
+        f"  {pad(instance_id, id_width)}  {pad(side_a, a_width)}  {pad(side_b, b_width)}  {pad(started, start_width)}  {pad(elapsed, time_width)}  {error}".rstrip()
+        for instance_id, side_a, side_b, started, elapsed, error in rendered
     ]
     return header + "\n".join(lines) + "\n"

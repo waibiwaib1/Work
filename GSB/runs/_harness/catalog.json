@@ -3,5 +3,100 @@
     "image_name": "docker.io/swerebenchv2/rust-analyzer-rust-analyzer:4043-e99447f",
     "test_cmd": "cargo test -- --nocapture",
     "language": "rust"
+  },
+  "ash-project__ash_graphql-166": {
+    "image_name": "docker.io/swerebenchv2/ash-project-ash_graphql:166-3be2f32",
+    "test_cmd": "mix test --trace --max-cases 1",
+    "language": "elixir"
+  },
+  "benbjohnson__litestream-301": {
+    "image_name": "docker.io/swerebenchv2/benbjohnson-litestream:301-8009bcf",
+    "test_cmd": "go test -v ./...",
+    "language": "go"
+  },
+  "genjidb__genji-378": {
+    "image_name": "docker.io/swerebenchv2/genjidb-genji:378-4f38ff4",
+    "test_cmd": "go test -v ./...",
+    "language": "go"
+  },
+  "onflow__flow-cli-1448": {
+    "image_name": "docker.io/swerebenchv2/onflow-flow-cli:1448-68d7752",
+    "test_cmd": "cd /flow-cli && export PATH=$PATH:/usr/local/go/bin && export GOPATH=/tmp/go && export GOCACHE=/tmp/go/cache && export HOME=/tmp && go test -v ./...",
+    "language": "go"
+  },
+  "avaje__avaje-inject-462": {
+    "image_name": "docker.io/swerebenchv2/avaje-avaje-inject:462-3302086",
+    "test_cmd": "mvn test -P '!default' -Dstyle.color=never --no-transfer-progress -B",
+    "language": "java"
+  },
+  "rwjblue__ember-template-lint-134": {
+    "image_name": "docker.io/swerebenchv2/rwjblue-ember-template-lint:134-11e1c7f",
+    "test_cmd": "npx mocha --reporter list test/",
+    "language": "js"
+  },
+  "wix__detox-1694": {
+    "image_name": "docker.io/swerebenchv2/wix-detox:1694-d606650",
+    "test_cmd": "cd detox && npx jest --verbose --no-color",
+    "language": "js"
+  },
+  "getmoto__moto-6391": {
+    "image_name": "docker.io/swerebenchv2/getmoto-moto:6391-6d9f464",
+    "test_cmd": "pytest --no-header -rA --tb=line --color=no -p no:cacheprovider -W ignore::DeprecationWarning tests/test_appconfig/test_appconfig_applications.py tests/test_appconfig/test_appconfig_config_profiles.py tests/test_appconfig/test_appconfig_hosted_config_versions.py",
+    "language": "python"
+  },
+  "jcrist__msgspec-181": {
+    "image_name": "docker.io/swerebenchv2/jcrist-msgspec:181-a9d28d8",
+    "test_cmd": "pytest --no-header -rA --tb=line --color=no -p no:cacheprovider -W ignore::DeprecationWarning tests/basic_typing_examples.py tests/test_schema.py",
+    "language": "python"
+  },
+  "pennylaneai__pennylane-1884": {
+    "image_name": "docker.io/swerebenchv2/pennylaneai-pennylane:1884-6e817db",
+    "test_cmd": "pytest --no-header -rA --tb=line --color=no -p no:cacheprovider -W ignore::DeprecationWarning tests/gradients/test_param_shift_hessian.py",
+    "language": "python"
+  },
+  "theacodes__nox-187": {
+    "image_name": "docker.io/swerebenchv2/theacodes-nox:187-1709f16",
+    "test_cmd": "pytest --no-header -rA --tb=line --color=no -p no:cacheprovider -W ignore::DeprecationWarning tests/resources/noxfile_options.py tests/test__option_set.py tests/test_main.py tests/test_sessions.py tests/test_tasks.py",
+    "language": "python"
+  },
+  "twisted__treq-400": {
+    "image_name": "docker.io/swerebenchv2/twisted-treq:400-ca3966f",
+    "test_cmd": "pytest --no-header -rA --tb=line --color=no -p no:cacheprovider -W ignore::DeprecationWarning src/treq/test/test_multipart.py",
+    "language": "python"
+  },
+  "rust-lang__rust-analyzer-17258": {
+    "image_name": "docker.io/swerebenchv2/rust-lang-rust-analyzer:17258-f6fc109",
+    "test_cmd": "cargo test -- --nocapture",
+    "language": "rust"
+  },
+  "rust-lang__rust-analyzer-13707": {
+    "image_name": "docker.io/swerebenchv2/rust-lang-rust-analyzer:13707-398a71a",
+    "test_cmd": "cargo test -- --format pretty --nocapture",
+    "language": "rust"
+  },
+  "yshavit__mdq-86": {
+    "image_name": "docker.io/swerebenchv2/yshavit-mdq:86-32ffc4f",
+    "test_cmd": "cargo test --verbose",
+    "language": "rust"
+  },
+  "algorand__js-algorand-sdk-454": {
+    "image_name": "docker.io/swerebenchv2/algorand-js-algorand-sdk:454-f11084b",
+    "test_cmd": "node -r ts-node/register tests/mocha.js --reporter spec",
+    "language": "ts"
+  },
+  "iduxfe__components-121": {
+    "image_name": "docker.io/swerebenchv2/iduxfe-components:121-552bd95",
+    "test_cmd": "npx jest --verbose --silent=false --no-colors --ci",
+    "language": "ts"
+  },
+  "iduxfe__components-176": {
+    "image_name": "docker.io/swerebenchv2/iduxfe-components:176-b6d178c",
+    "test_cmd": "npx jest --verbose --silent=false --no-colors --ci",
+    "language": "ts"
+  },
+  "ota-meshi__eslint-plugin-regexp-249": {
+    "image_name": "docker.io/swerebenchv2/ota-meshi-eslint-plugin-regexp:249-a2dda66",
+    "test_cmd": "npm run test:base -- --reporter spec --color=false",
+    "language": "ts"
   }
 }

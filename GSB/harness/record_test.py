@@ -19,13 +19,11 @@ from pathlib import Path
 
 from paths import RUNS, WORK
 from records import (
-    build_sheet_row,
     load_state,
     load_task,
     store_side,
     task_outcome,
     update_status,
-    upsert_sheet_row,
 )
 from runtime import docker_pull, remove_test_container, test_container_name
 
@@ -115,10 +113,6 @@ def remember(instance_id: str, side: str, video: Path, test_exit: int | None) ->
         instance_id,
         **{f"video_{side}": "done", f"s3_{side}": "", "uploaded": False, "uploaded_at": None},
     )
-    try:
-        upsert_sheet_row(build_sheet_row({"instance_id": instance_id}))
-    except PermissionError:
-        print("sheet is open, left the video path in task.json only")
 
 
 def play(instance_id: str, side: str, timeout: int) -> int:

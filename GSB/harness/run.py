@@ -20,7 +20,6 @@ import relay
 from paths import CODEX_LINUX, HARNESS_STATE, PUSH_URL, RUNS, snapshot_url
 from records import (
     build_catalog,
-    build_sheet_row,
     load_candidates,
     load_state,
     load_task,
@@ -30,7 +29,6 @@ from records import (
     task_outcome,
     task_record_path,
     update_status,
-    upsert_sheet_row,
     utc_now,
     write_json,
 )
@@ -120,7 +118,6 @@ def execute_task(
             status_fields[f"video_{side}"] = ""
             status_fields[f"s3_{side}"] = ""
     update_status(instance_id, **status_fields)
-    upsert_sheet_row(build_sheet_row(row))
     acquired = False
     succeeded = False
     try:
@@ -187,7 +184,6 @@ def execute_task(
                 print(f"{instance_id} {side} upload failed: {exc}", flush=True)
             record["sides"][side] = merged
         write_json(task_record_path(instance_id), record)
-        upsert_sheet_row(build_sheet_row(row))
         uploaded_sides = {
             f"s3_{side}": "done"
             for side, info in record["sides"].items()
