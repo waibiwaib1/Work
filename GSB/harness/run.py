@@ -348,13 +348,26 @@ def cmd_status(args: argparse.Namespace) -> int:
         mode = ctypes.c_uint()
         if ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             ctypes.windll.kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    print("\033[?1049h\033[?25l", end="", flush=True)
     try:
         while True:
-            print("\033[2J\033[H" + render_status(), end="", flush=True)
+            try:
+                size = os.get_terminal_size(sys.stdout.fileno())
+            except OSError:
+                size = os.terminal_size((120, 30))
+            lines = render_status().splitlines()
+            available = max(size.lines - 1, 1)
+            hidden = max(len(lines) - available, 0)
+            lines = lines[:available]
+            if hidden and available > 2:
+                lines[-1] = f"  … {hidden} more rows"
+            frame = "\n".join(line[: size.columns] for line in lines)
+            print("\033[2J\033[H" + frame, end="", flush=True)
             time.sleep(1)
     except KeyboardInterrupt:
-        print()
         return 0
+    finally:
+        print("\033[?25h\033[?1049l", end="", flush=True)
 
 
 def main() -> int:

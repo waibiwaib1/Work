@@ -12,15 +12,28 @@ import time
 from pathlib import Path
 
 import relay
-from paths import CODEX_HOME, CODEX_LINUX, EXPECTED_WINDOW, MODEL, MODEL_PROVIDER, RUNS, WORK
+from paths import CODEX_HOME, CODEX_LINUX, EXPECTED_WINDOW, MODEL, MODEL_PROVIDER, ROOT, RUNS, WORK
 from records import load_task, task_record_path, task_type_from_categories, write_json
 
 _pull_lock = threading.Lock()
 _pulled: set[str] = set()
 _image_users: dict[str, int] = {}
+_HOOKS = ROOT / "harness" / "empty-hooks"
+_ILLEGAL_CHARS = set('<>:"|?*')
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"}
 
 
-def run_cmd(args: list[str], cwd: Path | None = None, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+def run_cmd(
+    args: list[str],
+    cwd: Path | None = None,
+    timeout: int | None = None,
+    env: dict[str, str] | None = None,
+    input: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    merged = None
+    if env:
+        merged = os.environ.copy()
+        merged.update(env)
     return subprocess.run(
         args,
         cwd=cwd,
@@ -30,6 +43,8 @@ def run_cmd(args: list[str], cwd: Path | None = None, timeout: int | None = None
         capture_output=True,
         timeout=timeout,
         check=False,
+        env=merged,
+        input=input,
     )
 
 
@@ -87,8 +102,91 @@ def call_with_retry(action, label: str, attempts: int = 5, network_only: bool = 
             time.sleep(wait)
 
 
-def git(repo: Path, *args: str, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    return run_cmd(["git", "-C", str(repo), *args], timeout=timeout)
+def git(
+    repo: Path,
+    *args: str,
+    timeout: int | None = None,
+    input: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run git with repo hooks disabled. Checkout must not fail on husky."""
+    _HOOKS.mkdir(parents=True, exist_ok=True)
+    return run_cmd(
+        ["git", "-c", f"core.hooksPath={_HOOKS}", "-C", str(repo), *args],
+        timeout=timeout,
+        input=input,
+        env={"HUSKY": "0", "HUSKY_SKIP_HOOKS": "1"},
+    )
+
+
+def windows_illegal(path: str) -> bool:
+    for part in path.replace("\\", "/").split("/"):
+        if part in ("", ".", ".."):
+            continue
+        if part.endswith(".") or part.endswith(" "):
+            return True
+        if any(char in part for char in _ILLEGAL_CHARS):
+            return True
+        stem = part.split(".", 1)[0].upper()
+        if stem in _RESERVED_NAMES:
+            return True
+        if len(stem) == 4 and stem[:3] in {"COM", "LPT"} and stem[3].isdigit():
+            return True
+    return False
+
+
+def skip_illegal_windows_paths(repo: Path, sha: str) -> None:
+    """Leave Windows-illegal paths out of the worktree via a cone sparse-checkout."""
+    listed = git(repo, "ls-tree", "-r", "--name-only", sha)
+    if listed.returncode != 0:
+        raise RuntimeError(listed.stderr.strip() or "git ls-tree failed")
+    names = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    illegal = [name for name in names if windows_illegal(name)]
+    if not illegal:
+        return
+    root_illegal = [name for name in illegal if "/" not in name]
+    if root_illegal:
+        raise RuntimeError("windows cannot checkout " + ", ".join(root_illegal))
+    blocked: set[str] = set()
+    all_dirs: set[str] = set()
+    for path in names:
+        acc = ""
+        for part in path.split("/")[:-1]:
+            acc = f"{acc}/{part}" if acc else part
+            all_dirs.add(acc)
+    for path in illegal:
+        acc = ""
+        for part in path.split("/")[:-1]:
+            acc = f"{acc}/{part}" if acc else part
+            blocked.add(acc)
+    include: list[str] = []
+    for directory in sorted(all_dirs):
+        if directory in blocked:
+            continue
+        parent = directory.rsplit("/", 1)[0] if "/" in directory else ""
+        if parent and parent not in blocked:
+            continue
+        include.append(directory)
+    print(f"skip {len(illegal)} windows-illegal paths under {repo}", flush=True)
+    init = git(repo, "sparse-checkout", "init", "--cone", "--sparse-index")
+    if init.returncode != 0:
+        raise RuntimeError(init.stderr.strip() or "sparse-checkout init failed")
+    selected = git(repo, "sparse-checkout", "set", "--stdin", "--cone", input="\n".join(include) + "\n")
+    if selected.returncode != 0:
+        raise RuntimeError(selected.stderr.strip() or "sparse-checkout set failed")
+
+
+def force_checkout(repo: Path, sha: str, branch: str | None) -> None:
+    skip_illegal_windows_paths(repo, sha)
+    cleaned = git(repo, "clean", "-fdx")
+    if cleaned.returncode != 0:
+        raise RuntimeError(cleaned.stderr.strip() or "git clean failed")
+    if branch:
+        checked = git(repo, "checkout", "-f", "-B", branch, sha)
+    else:
+        checked = git(repo, "checkout", "-f", "--detach", sha)
+    if checked.returncode != 0:
+        detail = (checked.stderr or checked.stdout).strip()
+        raise RuntimeError(detail or "git checkout failed")
 
 
 def remove_tree(path: Path) -> None:
@@ -119,18 +217,6 @@ def _ignore_git_locks(directory: str, names: list[str]) -> set[str]:
     if ".git" in Path(directory).parts:
         return {name for name in names if name.endswith(".lock")}
     return set()
-
-
-def reset_to_base(repo: Path, sha: str, branch: str) -> None:
-    hard = git(repo, "reset", "--hard", sha)
-    if hard.returncode != 0:
-        raise RuntimeError(hard.stderr.strip() or "git reset failed")
-    cleaned = git(repo, "clean", "-fd")
-    if cleaned.returncode != 0:
-        raise RuntimeError(cleaned.stderr.strip() or "git clean failed")
-    branched = git(repo, "checkout", "-B", branch, sha)
-    if branched.returncode != 0:
-        raise RuntimeError(branched.stderr.strip() or "git branch failed")
 
 
 def prepare(row: dict, meta_extra: dict, force: bool, retry: bool, keep: set[str] | None = None) -> str:
@@ -169,14 +255,18 @@ def prepare(row: dict, meta_extra: dict, force: bool, retry: bool, keep: set[str
             if src.exists():
                 remove_tree(src)
             src.parent.mkdir(parents=True, exist_ok=True)
+            _HOOKS.mkdir(parents=True, exist_ok=True)
             run_visible(
                 [
                     "git",
+                    "-c",
+                    f"core.hooksPath={_HOOKS}",
                     "-c",
                     "http.lowSpeedLimit=1000",
                     "-c",
                     "http.lowSpeedTime=60",
                     "clone",
+                    "--no-checkout",
                     "--progress",
                     f"https://github.com/{row['repo']}.git",
                     str(src),
@@ -184,10 +274,8 @@ def prepare(row: dict, meta_extra: dict, force: bool, retry: bool, keep: set[str
             )
 
         call_with_retry(clone_once, "git clone")
-        checked = git(src, "checkout", "--detach", sha)
-        if checked.returncode != 0:
-            raise RuntimeError(checked.stderr.strip() or "git checkout failed")
     clear_git_locks(src)
+    force_checkout(src, sha, None)
     for side in ("a", "b"):
         if side in keep:
             continue
@@ -195,16 +283,10 @@ def prepare(row: dict, meta_extra: dict, force: bool, retry: bool, keep: set[str
         branch = side_branch(instance_id, side)
         if force and side_dir.exists():
             remove_tree(side_dir)
-        created = not side_dir.exists()
-        if created:
+        if not side_dir.exists():
             shutil.copytree(src, side_dir, ignore=_ignore_git_locks)
         clear_git_locks(side_dir)
-        if retry and not created:
-            reset_to_base(side_dir, sha, branch)
-        else:
-            branched = git(side_dir, "checkout", "-B", branch, sha)
-            if branched.returncode != 0:
-                raise RuntimeError(branched.stderr.strip() or "git branch failed")
+        force_checkout(side_dir, sha, branch)
         head = git(side_dir, "rev-parse", "HEAD")
         dirty = git(side_dir, "status", "--porcelain")
         if head.stdout.strip() != sha or dirty.stdout.strip():
@@ -269,6 +351,7 @@ def prepare_codex_home(instance_id: str, side: str) -> Path:
                 f'base_url = "{base_url}"',
                 'wire_api = "responses"',
                 'env_key = "SUPER_RELAY_KEY"',
+                "request_max_retries = 0",
                 "",
             ]
         ),
@@ -297,6 +380,7 @@ def run_codex(instance_id: str, side: str, image: str, prompt: str, log_path: Pa
         f"--config model_providers.{MODEL_PROVIDER}.base_url={relay.proxy_base(instance_id, side)} "
         f"--config model_providers.{MODEL_PROVIDER}.wire_api=responses "
         f"--config model_providers.{MODEL_PROVIDER}.env_key=SUPER_RELAY_KEY "
+        f"--config model_providers.{MODEL_PROVIDER}.request_max_retries=0 "
         f"--config model_context_window={EXPECTED_WINDOW} "
         "--config model_instructions_file=/root/.codex/relay_base_instructions.txt "
         "--config model_catalog_json=/root/.codex/relay_model_catalog.json"

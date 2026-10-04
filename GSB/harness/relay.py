@@ -1,8 +1,8 @@
 """Local Codex proxy. Retries 403/429/502/503 before any response body is sent.
 
-Wait uses truncated binary exponential backoff. Containers call
-http://host.docker.internal:8787/v1. This process forwards to the real gateway
-and keeps one request in flight.
+Wait uses truncated binary exponential backoff. A recovered request wakes other
+retry sleepers for staggered probes. Containers call the per-task routes under
+http://host.docker.internal:8787.
 """
 
 from __future__ import annotations
@@ -21,10 +21,11 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8787
 PROXY_BASE = f"http://host.docker.internal:{LISTEN_PORT}/v1"
 RETRY_STATUSES = {403, 429, 502, 503}
-RETRY_BUDGET_SECONDS = 6 * 60
 RETRY_LIMIT_SECONDS = 30 * 60
 SLOT_SECONDS = 1.0
 BACKOFF_EXPONENT_CAP = 6
+RECOVERY_JITTER_SECONDS = 5.0
+RECOVERY_SIGNAL_COOLDOWN_SECONDS = 5.0
 HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -37,11 +38,8 @@ HOP_HEADERS = {
     "host",
 }
 
-_slot = threading.BoundedSemaphore(2)
-_backoff_lock = threading.Lock()
-_backoff_attempt = 0
-_last_penalty = 0.0
 QUIET_SECONDS = 60.0
+_slot = threading.BoundedSemaphore(2)
 _sides_lock = threading.Lock()
 _sides: dict[tuple[str, str], dict] = {}
 _retry_counts: dict[tuple[str, str], int] = {}
@@ -139,23 +137,102 @@ def truncated_binary_backoff(attempt: int) -> float:
     return slots * SLOT_SECONDS
 
 
-def next_backoff() -> tuple[int, float]:
-    global _backoff_attempt, _last_penalty
-    with _backoff_lock:
-        _backoff_attempt = min(_backoff_attempt + 1, BACKOFF_EXPONENT_CAP)
-        _last_penalty = time.monotonic()
-        attempt = _backoff_attempt
-    return attempt, truncated_binary_backoff(attempt)
+class BackoffController:
+    """Global congestion state shared by all relay requests."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._condition:
+            self._attempt = 0
+            self._last_penalty = 0.0
+            self._generation = 0
+            self._last_reward = 0.0
+            self._penalized_generation = 0
+
+    def generation(self) -> int:
+        with self._condition:
+            return self._generation
+
+    def join_latest(
+        self,
+        known_generation: int,
+        probe_generation: int | None,
+    ) -> tuple[int, int | None]:
+        """Join a recovery wave that started while a request was in flight."""
+        current_generation = self.generation()
+        if current_generation != known_generation:
+            return current_generation, current_generation
+        return known_generation, probe_generation
+
+    def _reset_if_stable(self, now: float) -> None:
+        if self._attempt and now - self._last_penalty >= QUIET_SECONDS:
+            self._attempt = 0
+
+    def failure(self, probe_generation: int | None = None) -> tuple[int, float]:
+        """Record a failure; one recovery probe wave raises the level only once."""
+        with self._condition:
+            now = time.monotonic()
+            self._reset_if_stable(now)
+            should_raise = True
+            if probe_generation and probe_generation == self._generation:
+                should_raise = self._penalized_generation != probe_generation
+                self._penalized_generation = probe_generation
+            if should_raise:
+                self._attempt = min(self._attempt + 1, BACKOFF_EXPONENT_CAP)
+            self._last_penalty = now
+            attempt = self._attempt
+        return attempt, truncated_binary_backoff(attempt)
+
+    def recovery(self) -> tuple[int, int, bool]:
+        """Wake all sleepers; reward at most once per cooldown interval."""
+        now = time.monotonic()
+        with self._condition:
+            self._reset_if_stable(now)
+            rewarded = now - self._last_reward >= RECOVERY_SIGNAL_COOLDOWN_SECONDS
+            if rewarded:
+                self._attempt = max(self._attempt - 1, 0)
+                self._last_reward = now
+            self._generation += 1
+            generation = self._generation
+            level = self._attempt
+            self._condition.notify_all()
+        return generation, level, rewarded
+
+    def healthy(self) -> None:
+        """Apply the stable-period reset on ordinary successful traffic."""
+        with self._condition:
+            self._reset_if_stable(time.monotonic())
+
+    def wait(
+        self,
+        wait: float,
+        known_generation: int,
+        deadline: float,
+    ) -> tuple[int, int | None, float]:
+        """Wait for backoff or recovery, without crossing the retry deadline."""
+        started = time.monotonic()
+        timeout = min(wait, max(0.0, deadline - started))
+        with self._condition:
+            if self._generation == known_generation and timeout > 0:
+                self._condition.wait_for(
+                    lambda: self._generation != known_generation,
+                    timeout=timeout,
+                )
+            current_generation = self._generation
+        if current_generation == known_generation:
+            return current_generation, None, time.monotonic() - started
+        jitter = min(
+            random.uniform(0.0, RECOVERY_JITTER_SECONDS),
+            max(0.0, deadline - time.monotonic()),
+        )
+        time.sleep(jitter)
+        return current_generation, current_generation, time.monotonic() - started
 
 
-def ease_backoff() -> None:
-    global _backoff_attempt, _last_penalty
-    now = time.monotonic()
-    with _backoff_lock:
-        if _backoff_attempt == 0 or now - _last_penalty < QUIET_SECONDS:
-            return
-        _backoff_attempt -= 1
-        _last_penalty = now
+_backoff = BackoffController()
 
 
 class ReuseServer(ThreadingHTTPServer):
@@ -168,11 +245,9 @@ def start_relay(
     port: int = LISTEN_PORT,
     slots: int = 2,
 ) -> ThreadingHTTPServer:
-    global _slot, _backoff_attempt, _last_penalty
+    global _slot
     _slot = threading.BoundedSemaphore(max(slots, 1))
-    with _backoff_lock:
-        _backoff_attempt = 0
-        _last_penalty = 0.0
+    _backoff.reset()
     clear_activity()
     handler = make_handler(upstream)
     server = ReuseServer((host, port), handler)
@@ -226,19 +301,42 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                 note_side(instance, side, "running")
                 with _slot:
                     self._forward(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             finally:
                 note_side(instance, side, None)
 
         def _forward(self, body: bytes) -> None:
-            deadline = time.monotonic() + RETRY_BUDGET_SECONDS
+            # Codex request retries are disabled, so the relay owns the full
+            # retry window for this single request.
+            deadline: float | None = None
             retries = 0
+            known_generation = _backoff.generation()
+            probe_generation = None
             while True:
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    self.send_error(502, "upstream unavailable")
+                    return
+                request_timeout = 30.0 if deadline is None else min(30.0, deadline - now)
                 try:
                     conn, response = open_upstream(
-                        parsed, self.command, self._upstream_path, self.headers.items(), body
+                        parsed,
+                        self.command,
+                        self._upstream_path,
+                        self.headers.items(),
+                        body,
+                        request_timeout,
                     )
                 except (OSError, http.client.HTTPException):
-                    if time.monotonic() >= deadline:
+                    now = time.monotonic()
+                    if deadline is None:
+                        deadline = now + RETRY_LIMIT_SECONDS
+                    known_generation, probe_generation = _backoff.join_latest(
+                        known_generation,
+                        probe_generation,
+                    )
+                    if now >= deadline:
                         self.send_error(502, "upstream unavailable")
                         return
                     if retry_limited(self._instance, self._side):
@@ -249,51 +347,114 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                         self.send_error(502, "upstream unavailable")
                         return
                     retries += 1
-                    attempt, wait = next_backoff()
+                    attempt, wait = _backoff.failure(probe_generation)
                     print(
                         f"relay upstream error {side_label(self._side)} retry in {wait:.0f}s attempt {attempt}",
                         flush=True,
                     )
-                    note_side(self._instance, self._side, "retrying", wait=int(wait), attempt=attempt)
-                    time.sleep(wait)
-                    note_side(self._instance, self._side, "running")
+                    known_generation, probe_generation = self._wait_to_retry(
+                        wait,
+                        attempt,
+                        known_generation,
+                        deadline,
+                    )
+                    if time.monotonic() >= deadline:
+                        self.send_error(502, "upstream unavailable")
+                        return
                     continue
                 try:
-                    retryable = response.status in RETRY_STATUSES and time.monotonic() < deadline
-                    if retryable and retry_limited(self._instance, self._side):
+                    known_generation, probe_generation = _backoff.join_latest(
+                        known_generation,
+                        probe_generation,
+                    )
+                    retryable = response.status in RETRY_STATUSES
+                    if retryable and deadline is None:
+                        deadline = time.monotonic() + RETRY_LIMIT_SECONDS
+                    if retryable and (
+                        time.monotonic() >= deadline
+                        or retry_limited(self._instance, self._side)
+                    ):
                         print(
                             f"relay retry limit {response.status} {side_label(self._side)} after {RETRY_LIMIT_SECONDS // 60}m",
                             flush=True,
                         )
-                        self._send_upstream(response)
+                        self._send_upstream_status(response)
                         return
                     if retryable:
                         retries += 1
-                        attempt, wait = next_backoff()
+                        attempt, wait = _backoff.failure(probe_generation)
                         print(
                             f"relay {response.status} {side_label(self._side)} {self._upstream_path.split('?', 1)[0]} retry in {wait:.0f}s attempt {attempt}",
                             flush=True,
                         )
-                        response.read()
-                        note_side(
-                            self._instance,
-                            self._side,
-                            "retrying",
-                            wait=int(wait),
-                            attempt=attempt,
+                        conn.close()
+                        known_generation, probe_generation = self._wait_to_retry(
+                            wait,
+                            attempt,
+                            known_generation,
+                            deadline,
                             status=response.status,
                         )
-                        time.sleep(wait)
-                        note_side(self._instance, self._side, "running")
+                        if time.monotonic() >= deadline:
+                            self._send_upstream_status(response)
+                            return
                         continue
                     if response.status not in RETRY_STATUSES:
                         clear_retry_streak(self._instance, self._side)
-                    if retries == 0:
-                        ease_backoff()
+                    if 200 <= response.status < 300:
+                        if retries:
+                            generation, level, rewarded = _backoff.recovery()
+                            print(
+                                f"relay recovery wake generation {generation} backoff {level} rewarded={rewarded}",
+                                flush=True,
+                            )
+                        else:
+                            _backoff.healthy()
                     self._send_upstream(response)
                     return
                 finally:
                     conn.close()
+
+        def _wait_to_retry(
+            self,
+            wait: float,
+            attempt: int,
+            known_generation: int,
+            deadline: float,
+            status: int | None = None,
+        ) -> tuple[int, int | None]:
+            extra = {"status": status} if status is not None else {}
+            note_side(
+                self._instance,
+                self._side,
+                "retrying",
+                wait=int(min(wait, max(0.0, deadline - time.monotonic()))),
+                attempt=attempt,
+                **extra,
+            )
+            known_generation, probe_generation, actual_wait = _backoff.wait(
+                wait,
+                known_generation,
+                deadline,
+            )
+            if probe_generation is not None:
+                print(
+                    f"relay recovery probe {side_label(self._side)} in {actual_wait:.1f}s generation {probe_generation}",
+                    flush=True,
+                )
+            note_side(self._instance, self._side, "running")
+            return known_generation, probe_generation
+
+        def _send_upstream_status(self, response: http.client.HTTPResponse) -> None:
+            self.send_response(response.status, response.reason)
+            for key, value in response.getheaders():
+                if key.lower() in HOP_HEADERS or key.lower() == "content-length":
+                    continue
+                self.send_header(key, value)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
 
         def _send_upstream(self, response: http.client.HTTPResponse) -> None:
             self.send_response(response.status, response.reason)
@@ -311,17 +472,18 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             if self.command == "HEAD":
                 return
+            read_chunk = getattr(response, "read1", response.read)
             if has_length:
                 remaining = int(response.getheader("Content-Length") or "0")
                 while remaining:
-                    chunk = response.read(min(8192, remaining))
+                    chunk = read_chunk(min(8192, remaining))
                     if not chunk:
                         break
                     remaining -= len(chunk)
                     self.wfile.write(chunk)
                 return
             while True:
-                chunk = response.read(8192)
+                chunk = read_chunk(8192)
                 if not chunk:
                     break
                 self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii") + chunk + b"\r\n")
@@ -336,18 +498,28 @@ def open_upstream(
     path: str,
     headers,
     body: bytes,
+    timeout: float = 30.0,
 ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     if parsed.scheme == "https":
-        conn: http.client.HTTPConnection = http.client.HTTPSConnection(parsed.hostname, port, timeout=30)
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parsed.hostname,
+            port,
+            timeout=timeout,
+        )
     else:
-        conn = http.client.HTTPConnection(parsed.hostname, port, timeout=30)
+        conn = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
     forwarded = {"Host": parsed.hostname or ""}
     for key, value in headers:
         if key.lower() in HOP_HEADERS:
             continue
         forwarded[key] = value
-    conn.request(method, path, body=body or None, headers=forwarded)
+    try:
+        conn.request(method, path, body=body or None, headers=forwarded)
+        response = conn.getresponse()
+    except Exception:
+        conn.close()
+        raise
     if conn.sock is not None:
         conn.sock.settimeout(900)
-    return conn, conn.getresponse()
+    return conn, response
