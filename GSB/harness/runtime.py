@@ -21,6 +21,7 @@ _image_users: dict[str, int] = {}
 _HOOKS = ROOT / "harness" / "empty-hooks"
 _ILLEGAL_CHARS = set('<>:"|?*')
 _RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"}
+CODEX_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 def run_cmd(
@@ -367,6 +368,19 @@ def prepare_codex_home(instance_id: str, side: str) -> Path:
     return home
 
 
+def codex_container_name(instance_id: str, side: str) -> str:
+    return f"gsb-codex-{instance_id}-{side}"
+
+
+def remove_codex_container(instance_id: str, side: str) -> None:
+    subprocess.run(
+        ["docker", "rm", "-f", codex_container_name(instance_id, side)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 def run_codex(instance_id: str, side: str, image: str, prompt: str, log_path: Path) -> int:
     work_dir = WORK / instance_id / side
     container_dir = f"/work/{instance_id}/{side}"
@@ -390,6 +404,8 @@ def run_codex(instance_id: str, side: str, image: str, prompt: str, log_path: Pa
         "run",
         "--rm",
         "-i",
+        "--name",
+        codex_container_name(instance_id, side),
         "--entrypoint",
         "sh",
         "-v",
@@ -408,14 +424,21 @@ def run_codex(instance_id: str, side: str, image: str, prompt: str, log_path: Pa
         "-c",
         script,
     ]
+    remove_codex_container(instance_id, side)
     with log_path.open("w", encoding="utf-8", errors="replace") as log:
-        proc = subprocess.run(
-            command,
-            input=prompt.encode("utf-8"),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                command,
+                input=prompt.encode("utf-8"),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=CODEX_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            remove_codex_container(instance_id, side)
+            log.write(f"\nERROR: Codex timed out after {CODEX_TIMEOUT_SECONDS // 3600}h\n")
+            return 124
     return proc.returncode
 
 

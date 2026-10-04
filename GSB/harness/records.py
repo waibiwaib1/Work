@@ -219,7 +219,7 @@ def load_activity() -> dict:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -287,7 +287,7 @@ def render_status() -> str:
         return "no runs yet\n"
     try:
         state = json.loads(HARNESS_STATE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return "reading status...\n"
     tasks = state.get("tasks") or {}
     activity = load_activity()
