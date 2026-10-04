@@ -14,6 +14,7 @@ import argparse
 import os
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from records import (
     load_candidates,
     load_state,
     load_task,
+    mark_running_interrupted,
     render_status,
     reset_tasks,
     store_side,
@@ -117,6 +119,7 @@ def delivery_gap(instance_id: str, task: dict) -> str:
 def execute_task(
     row: dict,
     meta_extra: dict,
+    run_id: str,
     force: bool,
     retry: bool,
     run_tests: bool,
@@ -143,6 +146,7 @@ def execute_task(
         "duration_seconds": None,
         "uploaded": False,
         "uploaded_at": None,
+        "run_id": run_id,
         "error": "",
         "a": "done" if "a" in keep else "prep",
         "b": "done" if "b" in keep else "prep",
@@ -269,6 +273,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"missing {codex_bin}", file=sys.stderr)
         return 1
     only = set(args.instance) if args.instance else None
+    run_id = uuid.uuid4().hex[:12]
+    interrupted = mark_running_interrupted()
+    if interrupted:
+        print(f"marked {len(interrupted)} stale running tasks as interrupted", flush=True)
     rows = load_candidates(None, only)
     state = load_state()
     pending = []
@@ -307,6 +315,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     execute_task,
                     row,
                     catalog[row["instance_id"]],
+                    run_id,
                     args.force,
                     row["_retry"],
                     args.test,

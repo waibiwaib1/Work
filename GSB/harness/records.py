@@ -114,6 +114,40 @@ def update_status(instance_id: str, **fields: object) -> None:
         print(f"[{utc_now()}] {instance_id} {phase} {sides} {detail}".rstrip(), flush=True)
 
 
+def mark_running_interrupted() -> list[str]:
+    """Close stale running entries from a previous harness process."""
+    with _state_lock:
+        state = load_state()
+        interrupted = []
+        now = datetime.now(timezone.utc)
+        for instance_id, task in (state.get("tasks") or {}).items():
+            if task_outcome(task) != "running":
+                continue
+            interrupted.append(instance_id)
+            started = task.get("started_at")
+            duration = None
+            if started:
+                try:
+                    began = datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    duration = round((now - began).total_seconds(), 1)
+                except ValueError:
+                    pass
+            for side in ("a", "b"):
+                if task.get(side) not in ("done", "ok"):
+                    task[side] = "fail"
+            task.update(
+                phase="interrupted",
+                status="failed",
+                ended_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                duration_seconds=duration,
+                error="previous run was interrupted",
+            )
+        if interrupted:
+            state["updated_at"] = utc_now()
+            write_json(HARNESS_STATE, state)
+        return interrupted
+
+
 def task_record_path(instance_id: str):
     return RUNS / instance_id / "task.json"
 
@@ -211,6 +245,17 @@ def task_elapsed(task: dict) -> str:
     except ValueError:
         return "-"
     return format_elapsed((datetime.now(timezone.utc) - start).total_seconds())
+
+
+def retry_elapsed(live: dict | None) -> str:
+    starts = []
+    for info in (live or {}).values():
+        started = info.get("retry_since")
+        if isinstance(started, (int, float)):
+            starts.append(float(started))
+    if not starts:
+        return "-"
+    return format_elapsed(datetime.now(timezone.utc).timestamp() - min(starts))
 
 
 def load_activity() -> dict:
@@ -315,6 +360,7 @@ def render_status() -> str:
             side_label(task, "b", activity.get(instance_id)),
             task_started(task),
             task_elapsed(task),
+            retry_elapsed(activity.get(instance_id)),
             short_error(task),
         )
         for instance_id, task in shown
@@ -323,17 +369,20 @@ def render_status() -> str:
     a_width = max([1, *(len(item[1]) for item in rendered)], default=1)
     b_width = max([1, *(len(item[2]) for item in rendered)], default=1)
     start_width = max([5, *(len(item[3]) for item in rendered)], default=5)
-    time_width = max([4, *(len(item[4]) for item in rendered)], default=4)
+    total_width = max([5, *(len(item[4]) for item in rendered)], default=5)
+    retry_width = max([5, *(len(item[5]) for item in rendered)], default=5)
     header = (
         f"  running {len(running)}  success {success}  failed {len(failed)}  pending upload {pending_upload}\n"
-        f"  {pad('task', id_width)}  {pad('A', a_width)}  {pad('B', b_width)}  {pad('start', start_width)}  {pad('time', time_width)}  error\n"
+        f"  {pad('task', id_width)}  {pad('A', a_width)}  {pad('B', b_width)}"
+        f"  {pad('start', start_width)}  {pad('total', total_width)}  {pad('retry', retry_width)}  error\n"
     )
     if not tasks:
         return header + "  no tasks\n"
     if not rendered:
         return header + "  no running tasks\n"
     lines = [
-        f"  {pad(instance_id, id_width)}  {pad(side_a, a_width)}  {pad(side_b, b_width)}  {pad(started, start_width)}  {pad(elapsed, time_width)}  {error}".rstrip()
-        for instance_id, side_a, side_b, started, elapsed, error in rendered
+        f"  {pad(instance_id, id_width)}  {pad(side_a, a_width)}  {pad(side_b, b_width)}"
+        f"  {pad(started, start_width)}  {pad(elapsed, total_width)}  {pad(retry, retry_width)}  {error}".rstrip()
+        for instance_id, side_a, side_b, started, elapsed, retry, error in rendered
     ]
     return header + "\n".join(lines) + "\n"

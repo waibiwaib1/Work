@@ -44,6 +44,7 @@ _sides_lock = threading.Lock()
 _sides: dict[tuple[str, str], dict] = {}
 _retry_counts: dict[tuple[str, str], int] = {}
 _retry_since: dict[tuple[str, str], float] = {}
+_retry_since_wall: dict[tuple[str, str], float] = {}
 _activity_path: Path | None = None
 
 
@@ -72,6 +73,7 @@ def clear_activity() -> None:
         _sides.clear()
         _retry_counts.clear()
         _retry_since.clear()
+        _retry_since_wall.clear()
         _write_activity_locked()
 
 
@@ -89,6 +91,7 @@ def retry_limited(instance_id: str | None, side: str | None) -> bool:
         started = _retry_since.get(key)
         if started is None:
             _retry_since[key] = now
+            _retry_since_wall[key] = time.time()
             return False
         return now - started >= RETRY_LIMIT_SECONDS
 
@@ -97,7 +100,12 @@ def clear_retry_streak(instance_id: str | None, side: str | None) -> None:
     if not instance_id or side not in ("a", "b"):
         return
     with _sides_lock:
-        _retry_since.pop((instance_id, side), None)
+        key = (instance_id, side)
+        _retry_since.pop(key, None)
+        _retry_since_wall.pop(key, None)
+        if key in _sides:
+            _sides[key].pop("retry_since", None)
+            _write_activity_locked()
 
 
 def note_side(instance_id: str | None, side: str | None, phase: str | None, **extra: object) -> None:
@@ -110,7 +118,13 @@ def note_side(instance_id: str | None, side: str | None, phase: str | None, **ex
         else:
             if phase == "retrying":
                 _retry_counts[key] = _retry_counts.get(key, 0) + 1
-            _sides[key] = {"phase": phase, "count": _retry_counts.get(key, 0), **extra}
+            retry_since = _retry_since_wall.get(key)
+            _sides[key] = {
+                "phase": phase,
+                "count": _retry_counts.get(key, 0),
+                "retry_since": retry_since,
+                **extra,
+            }
         _write_activity_locked()
 
 
@@ -128,6 +142,27 @@ def _write_activity_locked() -> None:
 
 def side_label(side: str | None) -> str:
     return side if side in ("a", "b") else "-"
+
+
+def request_label(instance_id: str | None, side: str | None) -> str:
+    return f"{instance_id or '-'}:{side_label(side)}"
+
+
+def relay_log(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"[{timestamp}] {message}", flush=True)
+
+
+def rate_limit_headers(response: http.client.HTTPResponse) -> str:
+    """Return safe rate-limit response headers for diagnostics."""
+    values = []
+    for key, value in response.getheaders():
+        name = key.lower()
+        if name != "retry-after" and "ratelimit" not in name and "rate-limit" not in name:
+            continue
+        clean = " ".join(value.split())[:200]
+        values.append(f"{key}={clean}")
+    return " ".join(values)
 
 
 def truncated_binary_backoff(attempt: int) -> float:
@@ -198,7 +233,7 @@ class BackoffController:
             self._generation += 1
             generation = self._generation
             level = self._attempt
-            self._condition.notify_all()
+            self._condition.notify(1)
         return generation, level, rewarded
 
     def healthy(self) -> None:
@@ -211,7 +246,7 @@ class BackoffController:
         wait: float,
         known_generation: int,
         deadline: float,
-    ) -> tuple[int, int | None, float]:
+    ) -> tuple[int, int | None, float, float]:
         """Wait for backoff or recovery, without crossing the retry deadline."""
         started = time.monotonic()
         timeout = min(wait, max(0.0, deadline - started))
@@ -223,13 +258,13 @@ class BackoffController:
                 )
             current_generation = self._generation
         if current_generation == known_generation:
-            return current_generation, None, time.monotonic() - started
+            return current_generation, None, time.monotonic() - started, 0.0
         jitter = min(
             random.uniform(0.0, RECOVERY_JITTER_SECONDS),
             max(0.0, deadline - time.monotonic()),
         )
         time.sleep(jitter)
-        return current_generation, current_generation, time.monotonic() - started
+        return current_generation, current_generation, time.monotonic() - started, jitter
 
 
 _backoff = BackoffController()
@@ -254,7 +289,7 @@ def start_relay(
     thread = threading.Thread(target=server.serve_forever, name="gsb-relay", daemon=True)
     thread.start()
     bound = server.server_address[1]
-    print(f"relay http://{host}:{bound}/v1 -> {upstream}/v1 slots={max(slots, 1)}", flush=True)
+    relay_log(f"relay http://{host}:{bound}/v1 -> {upstream}/v1 slots={max(slots, 1)}")
     return server
 
 
@@ -328,7 +363,7 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                         body,
                         request_timeout,
                     )
-                except (OSError, http.client.HTTPException):
+                except (OSError, http.client.HTTPException) as exc:
                     now = time.monotonic()
                     if deadline is None:
                         deadline = now + RETRY_LIMIT_SECONDS
@@ -340,17 +375,20 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                         self.send_error(502, "upstream unavailable")
                         return
                     if retry_limited(self._instance, self._side):
-                        print(
-                            f"relay retry limit 502 {side_label(self._side)} after {RETRY_LIMIT_SECONDS // 60}m",
-                            flush=True,
+                        relay_log(
+                            f"relay retry limit 502 {request_label(self._instance, self._side)}"
+                            f" after {RETRY_LIMIT_SECONDS // 60}m"
                         )
                         self.send_error(502, "upstream unavailable")
                         return
                     retries += 1
                     attempt, wait = _backoff.failure(probe_generation)
-                    print(
-                        f"relay upstream error {side_label(self._side)} retry in {wait:.0f}s attempt {attempt}",
-                        flush=True,
+                    detail = " ".join(str(exc).split())[:200]
+                    relay_log(
+                        f"relay upstream error {request_label(self._instance, self._side)}"
+                        f" {type(exc).__name__}"
+                        + (f": {detail}" if detail else "")
+                        + f" retry in {wait:.0f}s attempt {attempt}"
                     )
                     known_generation, probe_generation = self._wait_to_retry(
                         wait,
@@ -374,18 +412,23 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                         time.monotonic() >= deadline
                         or retry_limited(self._instance, self._side)
                     ):
-                        print(
-                            f"relay retry limit {response.status} {side_label(self._side)} after {RETRY_LIMIT_SECONDS // 60}m",
-                            flush=True,
+                        limits = rate_limit_headers(response)
+                        relay_log(
+                            f"relay retry limit {response.status} {request_label(self._instance, self._side)}"
+                            f" after {RETRY_LIMIT_SECONDS // 60}m"
+                            + (f" {limits}" if limits else ""),
                         )
                         self._send_upstream_status(response)
                         return
                     if retryable:
                         retries += 1
                         attempt, wait = _backoff.failure(probe_generation)
-                        print(
-                            f"relay {response.status} {side_label(self._side)} {self._upstream_path.split('?', 1)[0]} retry in {wait:.0f}s attempt {attempt}",
-                            flush=True,
+                        limits = rate_limit_headers(response)
+                        relay_log(
+                            f"relay {response.status} {request_label(self._instance, self._side)}"
+                            f" {self._upstream_path.split('?', 1)[0]}"
+                            f" retry in {wait:.0f}s attempt {attempt}"
+                            + (f" {limits}" if limits else ""),
                         )
                         conn.close()
                         known_generation, probe_generation = self._wait_to_retry(
@@ -404,9 +447,9 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                     if 200 <= response.status < 300:
                         if retries:
                             generation, level, rewarded = _backoff.recovery()
-                            print(
-                                f"relay recovery wake generation {generation} backoff {level} rewarded={rewarded}",
-                                flush=True,
+                            relay_log(
+                                f"relay recovery wake one from {request_label(self._instance, self._side)}"
+                                f" generation {generation} backoff {level} rewarded={rewarded}"
                             )
                         else:
                             _backoff.healthy()
@@ -432,15 +475,16 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                 attempt=attempt,
                 **extra,
             )
-            known_generation, probe_generation, actual_wait = _backoff.wait(
+            known_generation, probe_generation, total_wait, jitter = _backoff.wait(
                 wait,
                 known_generation,
                 deadline,
             )
             if probe_generation is not None:
-                print(
-                    f"relay recovery probe {side_label(self._side)} in {actual_wait:.1f}s generation {probe_generation}",
-                    flush=True,
+                relay_log(
+                    f"relay recovery probe {request_label(self._instance, self._side)}"
+                    f" total_wait={total_wait:.1f}s jitter={jitter:.1f}s"
+                    f" generation {probe_generation}"
                 )
             note_side(self._instance, self._side, "running")
             return known_generation, probe_generation
