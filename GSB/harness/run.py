@@ -66,9 +66,13 @@ def run_side(instance_id: str, side: str, image: str, prompt: str, base: str, pu
             message = f"{message}: {detail}"
         update_status(instance_id, **{side: "fail"})
         raise RuntimeError(message)
-    rollout = collect_rollout(instance_id, side, side_started, side_ended)
-    head_info = capture_head(instance_id, side, base)
-    branch = push_side(instance_id, side, push_url) if push_url else side_branch(instance_id, side)
+    try:
+        rollout = collect_rollout(instance_id, side, side_started, side_ended)
+        head_info = capture_head(instance_id, side, base)
+        branch = push_side(instance_id, side, push_url) if push_url else side_branch(instance_id, side)
+    except Exception:
+        update_status(instance_id, **{side: "fail"})
+        raise
     info = {
         "started_at": started_at,
         "ended_at": utc_now(),

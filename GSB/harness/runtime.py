@@ -99,6 +99,28 @@ def remove_tree(path: Path) -> None:
     shutil.rmtree(path, onerror=onerror)
 
 
+def clear_git_locks(repo: Path) -> None:
+    """Drop leftover lock files so a crashed git does not block the next checkout."""
+    git_dir = repo / ".git"
+    if not git_dir.is_dir():
+        return
+    for name in ("index.lock", "HEAD.lock", "shallow.lock", "config.lock", "packed-refs.lock"):
+        lock = git_dir / name
+        if lock.is_file():
+            lock.unlink()
+    refs = git_dir / "refs"
+    if refs.is_dir():
+        for lock in refs.rglob("*.lock"):
+            if lock.is_file():
+                lock.unlink()
+
+
+def _ignore_git_locks(directory: str, names: list[str]) -> set[str]:
+    if ".git" in Path(directory).parts:
+        return {name for name in names if name.endswith(".lock")}
+    return set()
+
+
 def reset_to_base(repo: Path, sha: str, branch: str) -> None:
     hard = git(repo, "reset", "--hard", sha)
     if hard.returncode != 0:
@@ -165,6 +187,7 @@ def prepare(row: dict, meta_extra: dict, force: bool, retry: bool, keep: set[str
         checked = git(src, "checkout", "--detach", sha)
         if checked.returncode != 0:
             raise RuntimeError(checked.stderr.strip() or "git checkout failed")
+    clear_git_locks(src)
     for side in ("a", "b"):
         if side in keep:
             continue
@@ -174,7 +197,8 @@ def prepare(row: dict, meta_extra: dict, force: bool, retry: bool, keep: set[str
             remove_tree(side_dir)
         created = not side_dir.exists()
         if created:
-            shutil.copytree(src, side_dir)
+            shutil.copytree(src, side_dir, ignore=_ignore_git_locks)
+        clear_git_locks(side_dir)
         if retry and not created:
             reset_to_base(side_dir, sha, branch)
         else:
@@ -378,7 +402,7 @@ def capture_head(instance_id: str, side: str, base: str) -> dict:
         added = git(repo, "add", "-A")
         if added.returncode != 0:
             raise RuntimeError(added.stderr.strip() or "git add failed")
-        committed = git(repo, "commit", "-m", "snapshot: workflow capture of uncommitted agent changes")
+        committed = git(repo, "commit", "--no-verify", "-m", "snapshot: workflow capture of uncommitted agent changes")
         if committed.returncode != 0:
             raise RuntimeError(committed.stderr.strip() or "snapshot commit failed")
         head = git(repo, "rev-parse", "HEAD").stdout.strip()

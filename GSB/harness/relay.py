@@ -21,9 +21,10 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8787
 PROXY_BASE = f"http://host.docker.internal:{LISTEN_PORT}/v1"
 RETRY_STATUSES = {403, 429, 502, 503}
-RETRY_BUDGET_SECONDS = 12 * 60
+RETRY_BUDGET_SECONDS = 6 * 60
+RETRY_LIMIT_SECONDS = 30 * 60
 SLOT_SECONDS = 1.0
-BACKOFF_EXPONENT_CAP = 8
+BACKOFF_EXPONENT_CAP = 6
 HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -44,6 +45,7 @@ QUIET_SECONDS = 60.0
 _sides_lock = threading.Lock()
 _sides: dict[tuple[str, str], dict] = {}
 _retry_counts: dict[tuple[str, str], int] = {}
+_retry_since: dict[tuple[str, str], float] = {}
 _activity_path: Path | None = None
 
 
@@ -71,7 +73,33 @@ def clear_activity() -> None:
     with _sides_lock:
         _sides.clear()
         _retry_counts.clear()
+        _retry_since.clear()
         _write_activity_locked()
+
+
+def retry_limited(instance_id: str | None, side: str | None) -> bool:
+    """True once this side has been retrying for RETRY_LIMIT_SECONDS.
+
+    The clock starts at the first retry and keeps running across Codex reconnects.
+    A non-retry response clears it.
+    """
+    if not instance_id or side not in ("a", "b"):
+        return False
+    now = time.monotonic()
+    with _sides_lock:
+        key = (instance_id, side)
+        started = _retry_since.get(key)
+        if started is None:
+            _retry_since[key] = now
+            return False
+        return now - started >= RETRY_LIMIT_SECONDS
+
+
+def clear_retry_streak(instance_id: str | None, side: str | None) -> None:
+    if not instance_id or side not in ("a", "b"):
+        return
+    with _sides_lock:
+        _retry_since.pop((instance_id, side), None)
 
 
 def note_side(instance_id: str | None, side: str | None, phase: str | None, **extra: object) -> None:
@@ -213,6 +241,13 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                     if time.monotonic() >= deadline:
                         self.send_error(502, "upstream unavailable")
                         return
+                    if retry_limited(self._instance, self._side):
+                        print(
+                            f"relay retry limit 502 {side_label(self._side)} after {RETRY_LIMIT_SECONDS // 60}m",
+                            flush=True,
+                        )
+                        self.send_error(502, "upstream unavailable")
+                        return
                     retries += 1
                     attempt, wait = next_backoff()
                     print(
@@ -225,6 +260,13 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                     continue
                 try:
                     retryable = response.status in RETRY_STATUSES and time.monotonic() < deadline
+                    if retryable and retry_limited(self._instance, self._side):
+                        print(
+                            f"relay retry limit {response.status} {side_label(self._side)} after {RETRY_LIMIT_SECONDS // 60}m",
+                            flush=True,
+                        )
+                        self._send_upstream(response)
+                        return
                     if retryable:
                         retries += 1
                         attempt, wait = next_backoff()
@@ -244,6 +286,8 @@ def make_handler(upstream: str) -> type[BaseHTTPRequestHandler]:
                         time.sleep(wait)
                         note_side(self._instance, self._side, "running")
                         continue
+                    if response.status not in RETRY_STATUSES:
+                        clear_retry_streak(self._instance, self._side)
                     if retries == 0:
                         ease_backoff()
                     self._send_upstream(response)
