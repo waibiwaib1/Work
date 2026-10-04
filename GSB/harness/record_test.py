@@ -37,9 +37,18 @@ SWP_NOMOVE = 0x0002
 SWP_SHOWWINDOW = 0x0040
 
 
+def find_ffprobe(ffmpeg: str) -> str | None:
+    sibling = Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+    if sibling.is_file():
+        return str(sibling)
+    return shutil.which("ffprobe")
+
+
 def find_ffmpeg() -> str | None:
+    if os.name != "nt":
+        return None
     found = shutil.which("ffmpeg")
-    if found:
+    if found and find_ffprobe(found):
         return found
     candidates = [
         Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
@@ -50,7 +59,7 @@ def find_ffmpeg() -> str | None:
     if packages.is_dir():
         candidates.extend(packages.glob("Gyan.FFmpeg*/ffmpeg-*/bin/ffmpeg.exe"))
     for path in candidates:
-        if path.is_file():
+        if path.is_file() and find_ffprobe(str(path)):
             return str(path)
     return None
 
@@ -193,7 +202,9 @@ def play(instance_id: str, side: str, timeout: int) -> int:
 
 
 def keep_last_seconds(ffmpeg: str, video: Path, seconds: int = RECORD_TAIL_SECONDS) -> None:
-    ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe"))
+    ffprobe = find_ffprobe(ffmpeg)
+    if not ffprobe:
+        raise RuntimeError("FFprobe is required for test recording")
     probed = subprocess.run(
         [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(video)],
         capture_output=True,

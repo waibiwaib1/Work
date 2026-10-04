@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import random
 import threading
 import time
@@ -16,10 +17,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
-UPSTREAM = "https://seed-code.bytedance.com"
-LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = 8787
-PROXY_BASE = f"http://host.docker.internal:{LISTEN_PORT}/v1"
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+
+UPSTREAM = os.getenv("GSB_UPSTREAM") or "https://seed-code.bytedance.com"
+LISTEN_HOST = os.getenv("GSB_RELAY_LISTEN_HOST") or "0.0.0.0"
+LISTEN_PORT = int(os.getenv("GSB_RELAY_PORT") or "8787")
+CONTAINER_HOST = os.getenv("GSB_RELAY_CONTAINER_HOST") or "host.docker.internal"
+PROXY_BASE = f"http://{CONTAINER_HOST}:{LISTEN_PORT}/v1"
 RETRY_STATUSES = {403, 429, 502, 503}
 RETRY_LIMIT_SECONDS = 30 * 60
 SLOT_SECONDS = 1.0
@@ -49,7 +55,7 @@ _activity_path: Path | None = None
 
 
 def proxy_base(instance_id: str, side: str) -> str:
-    return f"http://host.docker.internal:{LISTEN_PORT}/s/{quote(instance_id, safe='')}/{side}/v1"
+    return f"http://{CONTAINER_HOST}:{LISTEN_PORT}/s/{quote(instance_id, safe='')}/{side}/v1"
 
 
 def split_route(path: str) -> tuple[str | None, str | None, str]:

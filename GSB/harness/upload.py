@@ -3,31 +3,23 @@
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import sys
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
-import boto3
-
-from paths import ROOT, RUNS, S3_BUCKET, S3_REGION
+from paths import RUNS, S3_BUCKET, S3_REGION
 from records import load_task, store_side, update_status
 from runtime import side_branch
 
-CONFIG_PATH = ROOT / "config.json"
-
-
 def load_s3_config() -> dict[str, str]:
-    if not CONFIG_PATH.exists():
-        raise RuntimeError(f"missing {CONFIG_PATH}")
-    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    bucket = str(data.get("bucket") or S3_BUCKET)
-    region = str(data.get("region") or S3_REGION)
-    key_id = str(data.get("aws_access_key_id") or "")
-    secret = str(data.get("aws_secret_access_key") or "")
-    if not key_id or not secret:
-        raise RuntimeError(f"{CONFIG_PATH} needs aws_access_key_id and aws_secret_access_key")
-    return {"bucket": bucket, "region": region, "aws_access_key_id": key_id, "aws_secret_access_key": secret}
+    return {
+        "bucket": os.getenv("GSB_S3_BUCKET") or S3_BUCKET,
+        "region": os.getenv("GSB_S3_REGION") or S3_REGION,
+        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID") or "",
+        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY") or "",
+        "aws_session_token": os.getenv("AWS_SESSION_TOKEN") or "",
+    }
 
 
 def object_url(key: str, bucket: str, region: str) -> str:
@@ -48,12 +40,17 @@ def object_headers(key: str) -> dict[str, str]:
 
 
 def s3_client(config: dict[str, str]):
-    return boto3.client(
-        "s3",
-        region_name=config["region"],
-        aws_access_key_id=config["aws_access_key_id"],
-        aws_secret_access_key=config["aws_secret_access_key"],
-    )
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError("boto3 is required for S3 upload; install requirements.txt") from exc
+    options = {"region_name": config["region"]}
+    if config["aws_access_key_id"] and config["aws_secret_access_key"]:
+        options["aws_access_key_id"] = config["aws_access_key_id"]
+        options["aws_secret_access_key"] = config["aws_secret_access_key"]
+        if config["aws_session_token"]:
+            options["aws_session_token"] = config["aws_session_token"]
+    return boto3.client("s3", **options)
 
 
 def url_key(url: str) -> str:

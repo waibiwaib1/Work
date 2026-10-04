@@ -1,14 +1,25 @@
 """Paths and fixed settings for the GSB harness."""
 
+import os
 from pathlib import Path
 
-ROOT = Path(r"D:\Code\Work\GSB")
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+
+
+def env_path(name: str, default: Path) -> Path:
+    value = os.getenv(name)
+    return Path(value or default).expanduser().resolve()
+
+
+ROOT = env_path("GSB_ROOT", Path(__file__).resolve().parents[1])
 CANDIDATES = ROOT / "candidates-3000.jsonl"
-SOURCE = Path(r"D:\Code\Work\Multi-SWE-bench\SWE-rebench\SWE-rebench")
-CODEX_LINUX = ROOT / "codex-linux"
-CODEX_HOME = Path.home() / ".codex"
-RUNS = Path(r"D:\Code\Work\GSB\runs")
-WORK = Path(r"D:\Code\Work\GSB\task")
+SOURCE = env_path("GSB_SOURCE", ROOT.parent / "Multi-SWE-bench" / "SWE-rebench" / "SWE-rebench")
+CODEX_LINUX = env_path("GSB_CODEX_LINUX", ROOT / "codex-linux")
+CODEX_HOME = env_path("CODEX_HOME", Path.home() / ".codex")
+RUNS = env_path("GSB_RUNS", ROOT / "runs")
+WORK = env_path("GSB_WORK", ROOT / "task")
 HARNESS_STATE = RUNS / "_harness" / "status.json"
 CATALOG = RUNS / "_harness" / "catalog.json"
 SHEET = RUNS / "_harness" / "sheet.csv"
@@ -47,10 +58,10 @@ SHEET_COLUMNS = [
     "排异",
 ]
 
-MODEL_PROVIDER = "super_relay"
-MODEL = "auto_model/urm"
-EXPECTED_WINDOW = 1000000
-PUSH_URL = "https://github.com/waibiwaib1/GSB10012026.git"
+MODEL_PROVIDER = os.getenv("GSB_MODEL_PROVIDER") or "super_relay"
+MODEL = os.getenv("GSB_MODEL") or "auto_model/urm"
+EXPECTED_WINDOW = int(os.getenv("GSB_MODEL_CONTEXT_WINDOW") or "1000000")
+PUSH_URL = os.getenv("GSB_PUSH_URL") or "https://github.com/waibiwaib1/GSB10012026.git"
 
 
 def snapshot_url(sha: str) -> str:
@@ -58,5 +69,5 @@ def snapshot_url(sha: str) -> str:
         return ""
     repo = PUSH_URL.removesuffix(".git")
     return f"{repo}/commit/{sha}"
-S3_BUCKET = "gsb10012026-591821376517-ap-northeast-2-an"
-S3_REGION = "ap-northeast-2"
+S3_BUCKET = os.getenv("GSB_S3_BUCKET") or "gsb10012026-591821376517-ap-northeast-2-an"
+S3_REGION = os.getenv("GSB_S3_REGION") or "ap-northeast-2"

@@ -1,5 +1,5 @@
 *.md
-config.json
+.env
 codex-linux/
 __pycache__/
 *.pyc

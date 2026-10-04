@@ -417,7 +417,7 @@ def run_codex(instance_id: str, side: str, image: str, prompt: str, log_path: Pa
         "-e",
         "SUPER_RELAY_KEY",
         "--add-host",
-        "host.docker.internal:host-gateway",
+        f"{relay.CONTAINER_HOST}:host-gateway",
         "-w",
         container_dir,
         image,

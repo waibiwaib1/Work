@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import relay
-from paths import CODEX_LINUX, HARNESS_STATE, PUSH_URL, RUNS, snapshot_url
+from paths import CANDIDATES, CODEX_HOME, CODEX_LINUX, HARNESS_STATE, PUSH_URL, RUNS, SOURCE, snapshot_url
 from records import (
     build_catalog,
     load_candidates,
@@ -183,7 +183,7 @@ def execute_task(
         summary_sides = {}
         ffmpeg = find_ffmpeg() if run_tests else None
         if run_tests and not ffmpeg:
-            print(f"{instance_id} recording skipped: ffmpeg is not installed", flush=True)
+            raise RuntimeError("FFmpeg and FFprobe are required for test recording")
         for side, info in sides.items():
             summary_sides[side] = diff_stats(instance_id, side, base, info["head"])
             if not run_tests:
@@ -265,6 +265,27 @@ def execute_task(
 def cmd_run(args: argparse.Namespace) -> int:
     if not os.environ.get("SUPER_RELAY_KEY"):
         print("SUPER_RELAY_KEY is not set", file=sys.stderr)
+        return 1
+    if args.test:
+        if os.name != "nt":
+            print("test recording currently requires Windows", file=sys.stderr)
+            return 1
+        if not find_ffmpeg():
+            print(
+                "FFmpeg and FFprobe are required for test recording. "
+                "Install with: winget install Gyan.FFmpeg",
+                file=sys.stderr,
+            )
+            return 1
+    required = [
+        CANDIDATES,
+        SOURCE,
+        CODEX_HOME / "relay_base_instructions.txt",
+        CODEX_HOME / "relay_model_catalog.json",
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        print("missing required paths:\n  " + "\n  ".join(missing), file=sys.stderr)
         return 1
     codex_bin = CODEX_LINUX / "bin" / "codex"
     try:

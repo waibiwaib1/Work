@@ -5,11 +5,31 @@
 #
 set -euo pipefail
 
-# ============ 请填入我们提供的三项 ============
-RELAY_BASE_URL="https://seed-code.bytedance.com/"
-RELAY_API_KEY="plat_nWzn1cBhMlE39ZHhJvR20P4wr2kd3cbOvYcw5jNqOhY"
-RELAY_MODEL_ID="auto_model/urm"
-# ============================================
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+ENV_FILE="${GSB_ENV_FILE:-$SCRIPT_DIR/.env}"
+if [ -f "$ENV_FILE" ]; then
+  while IFS='=' read -r key value; do
+    key="$(printf '%s' "$key" | tr -d '\r' | xargs)"
+    value="$(printf '%s' "$value" | tr -d '\r')"
+    case "$key" in
+      ''|\#*) continue ;;
+      *[!A-Za-z0-9_]*) continue ;;
+    esac
+    [ -n "$value" ] || continue
+    if [ -z "${!key-}" ]; then
+      export "$key=$value"
+    fi
+  done < "$ENV_FILE"
+fi
+
+RELAY_BASE_URL="${GSB_UPSTREAM:-https://seed-code.bytedance.com}"
+RELAY_API_KEY="${SUPER_RELAY_KEY:-}"
+RELAY_MODEL_ID="${GSB_MODEL:-auto_model/urm}"
+
+if [ -z "$RELAY_API_KEY" ]; then
+  echo "请先在 $ENV_FILE 中设置 SUPER_RELAY_KEY，或导出同名环境变量。" >&2
+  exit 1
+fi
 
 # Base URL 请原样填入，不要自己加 /v1；脚本会按 Codex 的要求补上
 RELAY_HOST="${RELAY_BASE_URL%/}"
