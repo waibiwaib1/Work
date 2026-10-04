@@ -98,5 +98,10 @@
     "image_name": "docker.io/swerebenchv2/ota-meshi-eslint-plugin-regexp:249-a2dda66",
     "test_cmd": "npm run test:base -- --reporter spec --color=false",
     "language": "ts"
+  },
+  "friendsofphp__php-cs-fixer-6447": {
+    "image_name": "docker.io/swerebenchv2/friendsofphp-php-cs-fixer:6447-4d5472c",
+    "test_cmd": "./vendor/bin/phpunit --testdox --verbose --colors=never",
+    "language": "php"
   }
 }

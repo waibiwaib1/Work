@@ -41,11 +41,16 @@ def find_ffmpeg() -> str | None:
     found = shutil.which("ffmpeg")
     if found:
         return found
-    for path in (
+    candidates = [
         Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
         Path.home() / "scoop" / "shims" / "ffmpeg.exe",
-    ):
-        if path.exists():
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links" / "ffmpeg.exe",
+    ]
+    packages = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+    if packages.is_dir():
+        candidates.extend(packages.glob("Gyan.FFmpeg*/ffmpeg-*/bin/ffmpeg.exe"))
+    for path in candidates:
+        if path.is_file():
             return str(path)
     return None
 
@@ -211,6 +216,8 @@ def keep_last_seconds(ffmpeg: str, video: Path, seconds: int = RECORD_TAIL_SECON
             f"-{seconds}",
             "-i",
             str(video),
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-c:v",
             "libx264",
             "-preset",
@@ -317,6 +324,8 @@ def _record_side_locked(instance_id: str, side: str, timeout: int, ffmpeg: str, 
                 "1",
                 "-i",
                 f"hwnd=0x{hwnd:x}",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                 "-c:v",
                 "libx264",
                 "-preset",

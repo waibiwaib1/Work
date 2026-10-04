@@ -72,10 +72,18 @@ def upload_file(path: Path, key: str) -> str:
     return object_url(key, config["bucket"], config["region"])
 
 
+def same_object(config: dict[str, str], key: str, path: Path) -> bool:
+    try:
+        head = s3_client(config).head_object(Bucket=config["bucket"], Key=key)
+    except Exception:
+        return False
+    return int(head.get("ContentLength") or -1) == path.stat().st_size
+
+
 def place_file(path: Path, key: str, current_url: str) -> str:
     """Keep an object under the branch-style key. An existing object is renamed in S3."""
     config = load_s3_config()
-    if current_url and url_key(current_url) == key:
+    if current_url and url_key(current_url) == key and same_object(config, key, path):
         return current_url
     client = s3_client(config)
     headers = object_headers(key)
@@ -113,7 +121,7 @@ def upload_side(instance_id: str, side: str, info: dict) -> bool:
         ready = ready and bool(info.get("s3_rollout"))
     video = info.get("test_video") or str(RUNS / instance_id / "artifacts" / f"{side}-test.mp4")
     video_path = Path(video)
-    if video_path.exists():
+    if video_path.is_file() and video_path.stat().st_size > 0:
         info["s3_url"] = place_file(video_path, artifact_key(instance_id, side, ".mp4"), info.get("s3_url") or "")
         info["test_video"] = info.get("test_video") or str(video_path)
         ready = ready and bool(info.get("s3_url"))

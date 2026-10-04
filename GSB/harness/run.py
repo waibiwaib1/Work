@@ -15,6 +15,8 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
 
 import relay
 from paths import CODEX_LINUX, HARNESS_STATE, PUSH_URL, RUNS, snapshot_url
@@ -81,6 +83,33 @@ def run_side(instance_id: str, side: str, image: str, prompt: str, base: str, pu
     return info
 
 
+def _artifact(instance_id: str, side: str, info: dict, key: str, name: str) -> Path:
+    raw = info.get(key) or ""
+    return Path(raw) if raw else RUNS / instance_id / "artifacts" / f"{side}-{name}"
+
+
+def delivery_gap(instance_id: str, task: dict) -> str:
+    """Finished sides that still need a test video or an S3 upload."""
+    if any(task.get(side) not in ("done", "ok") for side in ("a", "b")):
+        return ""
+    record = load_task(instance_id)
+    test_cmd = (record.get("test_cmd") or "").strip()
+    sides = record.get("sides") or {}
+    missing = []
+    for side in ("a", "b"):
+        info = sides.get(side) or {}
+        video = _artifact(instance_id, side, info, "test_video", "test.mp4")
+        video_ok = task.get(f"video_{side}") == "done" and video.is_file() and video.stat().st_size > 0
+        if test_cmd and not video_ok:
+            missing.append(f"video {side}")
+        rollout = _artifact(instance_id, side, info, "rollout_file", "rollout.jsonl")
+        if rollout.is_file() and not info.get("s3_rollout"):
+            missing.append(f"s3 rollout {side}")
+        if video_ok and not info.get("s3_url"):
+            missing.append(f"s3 video {side}")
+    return ", ".join(missing)
+
+
 def execute_task(
     row: dict,
     meta_extra: dict,
@@ -101,10 +130,11 @@ def execute_task(
         for side in ("a", "b"):
             if previous.get(side) in ("done", "ok") and saved_sides.get(side):
                 keep.add(side)
+    preserved_start = previous.get("started_at") if keep == {"a", "b"} else None
     status_fields = {
         "phase": "preparing",
         "status": "running",
-        "started_at": utc_now(),
+        "started_at": preserved_start or utc_now(),
         "ended_at": None,
         "duration_seconds": None,
         "uploaded": False,
@@ -168,9 +198,12 @@ def execute_task(
                 elif code != 0:
                     print(f"{instance_id} {side} recording failed, running the test without video", flush=True)
             if not recorded:
-                summary_sides[side]["test_exit"] = run_test(
-                    instance_id, side, image, meta_extra.get("test_cmd") or "", test_timeout
-                )
+                if side in keep and "test_exit" in info:
+                    summary_sides[side]["test_exit"] = info.get("test_exit")
+                else:
+                    summary_sides[side]["test_exit"] = run_test(
+                        instance_id, side, image, meta_extra.get("test_cmd") or "", test_timeout
+                    )
         record = load_task(instance_id)
         record["sides"] = {}
         for side, info in sides.items():
@@ -189,12 +222,19 @@ def execute_task(
             for side, info in record["sides"].items()
             if info.get("s3_rollout") or info.get("s3_url")
         }
+        duration = round(time.time() - started, 1)
+        if preserved_start:
+            try:
+                original = datetime.strptime(preserved_start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                duration = round((datetime.now(timezone.utc) - original).total_seconds(), 1)
+            except ValueError:
+                pass
         update_status(
             instance_id,
             phase="done",
             status="success",
             ended_at=utc_now(),
-            duration_seconds=round(time.time() - started, 1),
+            duration_seconds=duration,
             error="",
             **uploaded_sides,
         )
@@ -228,20 +268,30 @@ def cmd_run(args: argparse.Namespace) -> int:
     rows = load_candidates(None, only)
     state = load_state()
     pending = []
+    backfill = []
     skipped = 0
     for row in rows:
-        outcome = task_outcome(state.get("tasks", {}).get(row["instance_id"], {}))
+        instance_id = row["instance_id"]
+        task = state.get("tasks", {}).get(instance_id, {})
+        outcome = task_outcome(task)
         if outcome == "success" and not args.force:
-            skipped += 1
+            gap = delivery_gap(instance_id, task)
+            if gap:
+                row["_retry"] = False
+                backfill.append(row)
+                print(f"backfill {instance_id}: {gap}", flush=True)
+            else:
+                skipped += 1
             continue
         row["_retry"] = outcome in ("failed", "running")
         pending.append(row)
     if args.limit:
         pending = pending[: args.limit]
+    pending = backfill + pending
     if not pending:
         print(f"nothing to run, skipped {skipped} success  status={HARNESS_STATE}")
         return 0
-    print(f"run {len(pending)}, skipped {skipped} success", flush=True)
+    print(f"run {len(pending)}, backfill {len(backfill)}, skipped {skipped} success", flush=True)
     relay.set_activity_path(RUNS / "_harness" / "relay.json")
     relay_server = relay.start_relay(slots=args.concurrency * 2)
     catalog = build_catalog({row["instance_id"] for row in pending})
