@@ -1,5 +1,6 @@
 *.md
 .env
+candidates-3000.jsonl
 codex-linux/
 __pycache__/
 *.pyc

@@ -37,7 +37,7 @@ from records import (
     write_json,
 )
 from record_test import find_ffmpeg, record_side
-from upload import upload_side
+from upload import upload_side, upload_task
 from runtime import (
     capture_head,
     collect_rollout,
@@ -302,6 +302,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     state = load_state()
     pending = []
     backfill = []
+    upload_only = []
     skipped = 0
     for row in rows:
         instance_id = row["instance_id"]
@@ -310,9 +311,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         if outcome == "success" and not args.force:
             gap = delivery_gap(instance_id, task)
             if gap:
-                row["_retry"] = False
-                backfill.append(row)
-                print(f"backfill {instance_id}: {gap}", flush=True)
+                missing = [item.strip() for item in gap.split(",")]
+                if all(item.startswith("s3 ") for item in missing):
+                    upload_only.append(instance_id)
+                    print(f"upload-only {instance_id}: {gap}", flush=True)
+                else:
+                    row["_retry"] = False
+                    backfill.append(row)
+                    print(f"backfill {instance_id}: {gap}", flush=True)
             else:
                 skipped += 1
             continue
@@ -321,14 +327,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.limit:
         pending = pending[: args.limit]
     pending = backfill + pending
+    upload_failures = 0
+    if upload_only:
+        print(f"upload {len(upload_only)} existing tasks", flush=True)
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            futures = {pool.submit(upload_task, instance_id): instance_id for instance_id in upload_only}
+            for future in as_completed(futures):
+                instance_id = futures[future]
+                try:
+                    code = future.result()
+                except Exception as exc:  # noqa: BLE001 - one upload must not stop the others
+                    code = 1
+                    print(f"[{utc_now()}] {instance_id} upload failed {exc}", flush=True)
+                if code:
+                    upload_failures += 1
+        print(f"uploaded {len(upload_only) - upload_failures}/{len(upload_only)} existing tasks", flush=True)
     if not pending:
         print(f"nothing to run, skipped {skipped} success  status={HARNESS_STATE}")
-        return 0
+        return 1 if upload_failures else 0
     print(f"run {len(pending)}, backfill {len(backfill)}, skipped {skipped} success", flush=True)
     relay.set_activity_path(RUNS / "_harness" / "relay.json")
     relay_server = relay.start_relay(slots=args.concurrency * 2)
     catalog = build_catalog({row["instance_id"] for row in pending})
-    failures = 0
+    run_failures = 0
     try:
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             futures = {
@@ -350,13 +371,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 try:
                     future.result()
                 except Exception as exc:  # noqa: BLE001 - one task must not kill the pool
-                    failures += 1
+                    run_failures += 1
                     print(f"[{utc_now()}] {instance_id} failed {exc}", flush=True)
     finally:
         relay_server.shutdown()
         relay.clear_activity()
-    print(f"finished {len(pending) - failures}/{len(pending)}  status={HARNESS_STATE}")
-    return 1 if failures else 0
+    print(f"finished {len(pending) - run_failures}/{len(pending)}  status={HARNESS_STATE}")
+    return 1 if upload_failures or run_failures else 0
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
