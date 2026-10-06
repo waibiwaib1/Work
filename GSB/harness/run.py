@@ -42,6 +42,8 @@ from runtime import (
     capture_head,
     collect_rollout,
     diff_stats,
+    discard_worktree,
+    discard_finished_worktrees,
     docker_pull,
     image_acquire,
     image_release,
@@ -247,6 +249,7 @@ def execute_task(
             **uploaded_sides,
         )
         succeeded = True
+        discard_worktree(instance_id)
     except Exception as exc:
         update_status(
             instance_id,
@@ -298,6 +301,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     interrupted = mark_running_interrupted()
     if interrupted:
         print(f"marked {len(interrupted)} stale running tasks as interrupted", flush=True)
+    removed = discard_finished_worktrees()
+    if removed:
+        print(f"removed {removed} finished worktrees", flush=True)
     rows = load_candidates(None, only)
     state = load_state()
     pending = []

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import relay
 from paths import CODEX_HOME, CODEX_LINUX, EXPECTED_WINDOW, MODEL, MODEL_PROVIDER, ROOT, RUNS, WORK
-from records import load_task, task_record_path, task_type_from_categories, write_json
+from records import load_state, load_task, task_record_path, task_type_from_categories, write_json
 
 _pull_lock = threading.Lock()
 _pulled: set[str] = set()
@@ -285,6 +285,40 @@ def remove_tree(path: Path) -> None:
         func(target)
 
     shutil.rmtree(path, onerror=onerror)
+
+
+def _git_link(info: dict) -> str:
+    return str(info.get("permalink") or "").strip()
+
+
+def discard_worktree(instance_id: str) -> bool:
+    """Delete GSB/task/<id> once the task succeeded and both sides have a git link."""
+    task = (load_state().get("tasks") or {}).get(instance_id) or {}
+    if task.get("status") != "success":
+        return False
+    sides = (load_task(instance_id).get("sides") or {})
+    if not _git_link(sides.get("a") or {}) or not _git_link(sides.get("b") or {}):
+        return False
+    path = WORK / instance_id
+    if not path.is_dir():
+        return False
+    try:
+        remove_tree(path)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not change the task result
+        print(f"worktree remove failed {instance_id}: {exc}", flush=True)
+        return False
+    print(f"removed worktree {instance_id}", flush=True)
+    return True
+
+
+def discard_finished_worktrees() -> int:
+    removed = 0
+    for instance_id, task in (load_state().get("tasks") or {}).items():
+        if task.get("status") != "success":
+            continue
+        if discard_worktree(instance_id):
+            removed += 1
+    return removed
 
 
 def _git_dir(repo: Path) -> Path:
