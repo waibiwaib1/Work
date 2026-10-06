@@ -137,7 +137,7 @@ def note_side(instance_id: str | None, side: str | None, phase: str | None, **ex
 def _write_activity_locked() -> None:
     if _activity_path is None:
         return
-    payload: dict[str, dict] = {}
+    payload: dict = {"retrylevel": _backoff.level()}
     for (instance_id, side), info in _sides.items():
         payload.setdefault(instance_id, {})[side] = info
     _activity_path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,6 +192,10 @@ class BackoffController:
             self._generation = 0
             self._last_reward = 0.0
             self._penalized_generation = 0
+
+    def level(self) -> int:
+        with self._condition:
+            return self._attempt
 
     def generation(self) -> int:
         with self._condition:

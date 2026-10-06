@@ -258,6 +258,13 @@ def retry_elapsed(live: dict | None) -> str:
     return format_elapsed(datetime.now(timezone.utc).timestamp() - min(starts))
 
 
+def retry_level(activity: dict) -> int:
+    value = activity.get("retrylevel")
+    if isinstance(value, int) and value >= 0:
+        return value
+    return 0
+
+
 def load_activity() -> dict:
     path = RUNS / "_harness" / "relay.json"
     if not path.exists():
@@ -372,7 +379,7 @@ def render_status() -> str:
     total_width = max([5, *(len(item[4]) for item in rendered)], default=5)
     retry_width = max([5, *(len(item[5]) for item in rendered)], default=5)
     header = (
-        f"  running {len(running)}  success {success}  failed {len(failed)}  pending upload {pending_upload}\n"
+        f"  running {len(running)}  success {success}  failed {len(failed)}  pending upload {pending_upload}  retrylevel {retry_level(activity)}\n"
         f"  {pad('task', id_width)}  {pad('A', a_width)}  {pad('B', b_width)}"
         f"  {pad('start', start_width)}  {pad('total', total_width)}  {pad('retry', retry_width)}  error\n"
     )
