@@ -279,12 +279,70 @@ def _materialize_symlinks(repo: Path, sha: str) -> None:
             raise RuntimeError(detail or f"could not keep symlink {path}")
 
 
-def remove_tree(path: Path) -> None:
-    def onerror(func, target, exc_info):
-        os.chmod(target, stat.S_IWRITE)
-        func(target)
+def _reparse_point(path: str) -> bool:
+    try:
+        attrs = os.lstat(path).st_file_attributes
+    except (AttributeError, OSError):
+        return False
+    return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
-    shutil.rmtree(path, onerror=onerror)
+
+def _make_writable(path: str) -> None:
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        pass
+
+
+def _remove_reparse(path: str) -> None:
+    """Remove a junction or symlink without walking into its target."""
+    _make_writable(path)
+    try:
+        os.rmdir(path)
+    except OSError:
+        os.unlink(path)
+
+
+def remove_tree(path: Path) -> None:
+    """Delete a worktree, including broken node_modules junctions.
+
+    shutil.rmtree follows those junctions and then fails with WinError 1920
+    when the target is gone. A junction is removed as a link, not as a directory.
+    """
+    root = os.fspath(path)
+    if not os.path.lexists(root):
+        return
+    directories: list[str] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if _reparse_point(current):
+            _remove_reparse(current)
+            continue
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(mode):
+            _make_writable(current)
+            os.unlink(current)
+            continue
+        try:
+            children = list(os.scandir(current))
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1920:
+                _remove_reparse(current)
+                continue
+            raise
+        directories.append(current)
+        for child in children:
+            stack.append(child.path)
+    for directory in reversed(directories):
+        _make_writable(directory)
+        try:
+            os.rmdir(directory)
+        except FileNotFoundError:
+            pass
 
 
 def _git_link(info: dict) -> str:
