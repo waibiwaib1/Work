@@ -310,6 +310,12 @@ def short_error(task: dict) -> str:
 
 
 def _short_error_part(text: str) -> str:
+    fatal = ""
+    index = text.lower().rfind("fatal:")
+    if index >= 0:
+        fatal = text[index:].strip()
+        if len(fatal) > 140:
+            fatal = fatal[:139] + "…"
     match = re.match(r"command failed \((\d+)\): (.+)$", text)
     if match:
         code, rest = match.group(1), match.group(2)
@@ -319,9 +325,11 @@ def _short_error_part(text: str) -> str:
             while index < len(tokens) and tokens[index] == "-c":
                 index += 2
             sub = tokens[index] if index < len(tokens) else "git"
-            return f"git {sub} failed ({code})"
-        name = tokens[0] if tokens else "command"
-        return f"{name} failed ({code})"
+            summary = f"git {sub} failed ({code})"
+        else:
+            name = tokens[0] if tokens else "command"
+            summary = f"{name} failed ({code})"
+        return f"{summary}: {fatal}" if fatal else summary
     if len(text) > 80:
         return text[:79] + "…"
     return text

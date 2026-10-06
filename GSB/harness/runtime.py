@@ -51,9 +51,30 @@ def run_cmd(
 
 def run_visible(args: list[str]) -> None:
     print(" ".join(args), flush=True)
-    completed = subprocess.run(args, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(f"command failed ({completed.returncode}): {' '.join(args)}")
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    tail: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        text = line.strip()
+        if text:
+            tail.append(text)
+            if len(tail) > 20:
+                del tail[:-20]
+    code = proc.wait()
+    if code != 0:
+        detail = " | ".join(tail[-6:])
+        message = f"command failed ({code}): {' '.join(args)}"
+        if detail:
+            message = f"{message}: {detail}"
+        raise RuntimeError(message)
 
 
 _NETWORK_MARKERS = (
@@ -109,13 +130,30 @@ def git(
     timeout: int | None = None,
     input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run git with repo hooks disabled. Checkout must not fail on husky."""
+    """Run git with repo hooks disabled. Checkout must not fail on husky.
+
+    autocrlf and symlinks are forced off so a Windows host does not dirty the
+    tree or abort on a symlink the process is not allowed to create.
+    """
     _HOOKS.mkdir(parents=True, exist_ok=True)
     return run_cmd(
-        ["git", "-c", f"core.hooksPath={_HOOKS}", "-C", str(repo), *args],
+        [
+            "git",
+            "-c",
+            f"core.hooksPath={_HOOKS}",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.symlinks=false",
+            "-c",
+            "core.longpaths=true",
+            "-C",
+            str(repo),
+            *args,
+        ],
         timeout=timeout,
         input=input,
-        env={"HUSKY": "0", "HUSKY_SKIP_HOOKS": "1"},
+        env={"HUSKY": "0", "HUSKY_SKIP_HOOKS": "1", "FILTER_BRANCH_SQUELCH_WARNING": "1"},
     )
 
 
@@ -177,8 +215,11 @@ def skip_illegal_windows_paths(repo: Path, sha: str) -> None:
 
 
 def force_checkout(repo: Path, sha: str, branch: str | None) -> None:
+    clear_git_locks(repo)
     skip_illegal_windows_paths(repo, sha)
-    cleaned = git(repo, "clean", "-fdx")
+    # -ff removes nested repositories. -fdx leaves them, and status then
+    # reports the tree dirty at base_commit.
+    cleaned = git(repo, "clean", "-ffdx")
     if cleaned.returncode != 0:
         raise RuntimeError(cleaned.stderr.strip() or "git clean failed")
     if branch:
@@ -188,6 +229,54 @@ def force_checkout(repo: Path, sha: str, branch: str | None) -> None:
     if checked.returncode != 0:
         detail = (checked.stderr or checked.stdout).strip()
         raise RuntimeError(detail or "git checkout failed")
+    _materialize_symlinks(repo, sha)
+
+
+def _materialize_symlinks(repo: Path, sha: str) -> None:
+    """Replace symlink placeholders with the target file.
+
+    Windows refuses to create symlinks without extra privilege, so checkout
+    writes the link text. Copy the target and tell git to keep the index entry
+    as a symlink, otherwise status reports the tree dirty.
+    """
+    listed = git(repo, "ls-tree", "-r", "-z", sha)
+    if listed.returncode != 0:
+        raise RuntimeError(listed.stderr.strip() or "git ls-tree failed")
+    for record in listed.stdout.split("\0"):
+        if "\t" not in record:
+            continue
+        meta, path = record.split("\t", 1)
+        if not meta.startswith("120000"):
+            continue
+        link = repo / path
+        if not link.is_file():
+            continue
+        raw = link.read_bytes().splitlines()
+        if not raw:
+            continue
+        target = raw[0].decode("utf-8", errors="replace").strip()
+        if not target:
+            continue
+        dest = Path(target)
+        if not dest.is_absolute():
+            dest = link.parent / dest
+        try:
+            dest = dest.resolve()
+        except OSError:
+            continue
+        if dest == link.resolve():
+            continue
+        if dest.is_file():
+            shutil.copyfile(dest, link)
+        elif dest.is_dir():
+            link.unlink()
+            shutil.copytree(dest, link)
+        else:
+            continue
+        marked = git(repo, "update-index", "--assume-unchanged", "--", path)
+        if marked.returncode != 0:
+            detail = (marked.stderr or marked.stdout).strip()
+            raise RuntimeError(detail or f"could not keep symlink {path}")
 
 
 def remove_tree(path: Path) -> None:
@@ -198,9 +287,21 @@ def remove_tree(path: Path) -> None:
     shutil.rmtree(path, onerror=onerror)
 
 
+def _git_dir(repo: Path) -> Path:
+    git_path = repo / ".git"
+    if git_path.is_file():
+        line = git_path.read_text(encoding="utf-8", errors="replace").strip()
+        if line.lower().startswith("gitdir:"):
+            raw = Path(line.split(":", 1)[1].strip())
+            if not raw.is_absolute():
+                raw = repo / raw
+            return raw
+    return git_path
+
+
 def clear_git_locks(repo: Path) -> None:
     """Drop leftover lock files so a crashed git does not block the next checkout."""
-    git_dir = repo / ".git"
+    git_dir = _git_dir(repo)
     if not git_dir.is_dir():
         return
     for name in ("index.lock", "HEAD.lock", "shallow.lock", "config.lock", "packed-refs.lock"):
@@ -497,8 +598,92 @@ def collect_rollout(instance_id: str, side: str, started: float, ended: float) -
     return {"session_id": session_id, "model_context_window": window, "rollout_file": str(dest)}
 
 
+# GitHub rejects a push that contains a blob at or above this size.
+_GITHUB_BLOB_LIMIT = 100 * 1024 * 1024
+
+
+def _unstage_huge(repo: Path) -> None:
+    staged = git(repo, "diff", "--cached", "--name-only", "-z")
+    if staged.returncode != 0:
+        raise RuntimeError(staged.stderr.strip() or "git diff --cached failed")
+    huge: list[str] = []
+    for path in staged.stdout.split("\0"):
+        if not path:
+            continue
+        file = repo / path
+        try:
+            if file.is_file() and file.stat().st_size >= _GITHUB_BLOB_LIMIT:
+                huge.append(path)
+        except OSError:
+            continue
+    if not huge:
+        return
+    print(f"leave {len(huge)} files over 100MB out of the snapshot", flush=True)
+    removed = git(repo, "rm", "--cached", "-f", "--ignore-unmatch", "--", *huge)
+    if removed.returncode != 0:
+        raise RuntimeError(removed.stderr.strip() or "git rm --cached failed")
+
+
+def _huge_paths(repo: Path, base: str) -> list[str]:
+    listed = git(repo, "rev-list", "--objects", f"{base}..HEAD")
+    if listed.returncode != 0:
+        raise RuntimeError(listed.stderr.strip() or "git rev-list failed")
+    blobs: list[tuple[str, str]] = []
+    for line in listed.stdout.splitlines():
+        sha, _, path = line.partition(" ")
+        if path:
+            blobs.append((sha, path))
+    if not blobs:
+        return []
+    checked = git(repo, "cat-file", "--batch-check=%(objecttype) %(objectsize)", input="\n".join(sha for sha, _path in blobs) + "\n")
+    if checked.returncode != 0:
+        raise RuntimeError(checked.stderr.strip() or "git cat-file failed")
+    huge: list[str] = []
+    seen: set[str] = set()
+    for (_sha, path), info in zip(blobs, checked.stdout.splitlines()):
+        kind, _, size = info.partition(" ")
+        if kind != "blob" or not size.isdigit() or int(size) < _GITHUB_BLOB_LIMIT:
+            continue
+        if path not in seen:
+            seen.add(path)
+            huge.append(path)
+    return huge
+
+
+def _sh_quote(path: str) -> str:
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def _drop_huge_history(repo: Path, base: str) -> None:
+    """Rewrite commits after base so a push is not rejected for a blob over 100MB."""
+    huge = _huge_paths(repo, base)
+    if not huge:
+        return
+    print(f"drop {len(huge)} files over 100MB from history before push", flush=True)
+    current = git(repo, "branch", "--show-current")
+    if current.returncode != 0:
+        raise RuntimeError(current.stderr.strip() or "git branch failed")
+    if not current.stdout.strip():
+        parked = git(repo, "checkout", "-B", "gsb-strip-large")
+        if parked.returncode != 0:
+            raise RuntimeError(parked.stderr.strip() or "git checkout failed")
+    quoted = " ".join(_sh_quote(path) for path in huge)
+    rewritten = git(
+        repo,
+        "filter-branch",
+        "-f",
+        "--index-filter",
+        f"git rm -r --cached --ignore-unmatch -- {quoted}",
+        f"{base}..HEAD",
+    )
+    if rewritten.returncode != 0:
+        detail = (rewritten.stderr or rewritten.stdout).strip()
+        raise RuntimeError(detail or "git filter-branch failed")
+
+
 def capture_head(instance_id: str, side: str, base: str) -> dict:
     repo = WORK / instance_id / side
+    clear_git_locks(repo)
     dirty = git(repo, "status", "--porcelain")
     if dirty.returncode != 0:
         raise RuntimeError(dirty.stderr.strip() or "git status failed")
@@ -509,12 +694,20 @@ def capture_head(instance_id: str, side: str, base: str) -> dict:
         added = git(repo, "add", "-A")
         if added.returncode != 0:
             raise RuntimeError(added.stderr.strip() or "git add failed")
-        committed = git(repo, "commit", "--no-verify", "-m", "snapshot: workflow capture of uncommitted agent changes")
-        if committed.returncode != 0:
-            raise RuntimeError(committed.stderr.strip() or "snapshot commit failed")
+        _unstage_huge(repo)
+        staged = git(repo, "diff", "--cached", "--quiet")
+        if staged.returncode == 1:
+            committed = git(repo, "commit", "--no-verify", "-m", "snapshot: workflow capture of uncommitted agent changes")
+            if committed.returncode != 0:
+                raise RuntimeError(committed.stderr.strip() or "snapshot commit failed")
+            head = git(repo, "rev-parse", "HEAD").stdout.strip()
+            snapshot = True
+        elif staged.returncode != 0:
+            raise RuntimeError(staged.stderr.strip() or "git diff --cached failed")
+    if base and head and head != base:
+        _drop_huge_history(repo, base)
         head = git(repo, "rev-parse", "HEAD").stdout.strip()
-        snapshot = True
-    elif head == base:
+    if head == base:
         empty = True
         head = ""
     return {"head": head, "snapshot_commit": snapshot, "empty": empty}
