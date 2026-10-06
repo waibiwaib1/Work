@@ -99,6 +99,30 @@ def task_outcome(task: dict) -> str:
     return ""
 
 
+def set_current_run(run_id: str) -> None:
+    """Remember which run status should count as the current one."""
+    with _state_lock:
+        state = load_state()
+        state["run_id"] = run_id
+        state["updated_at"] = utc_now()
+        write_json(HARNESS_STATE, state)
+
+
+def current_run_id(state: dict) -> str:
+    recorded = state.get("run_id")
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    latest = ""
+    latest_start = ""
+    for task in (state.get("tasks") or {}).values():
+        run_id = task.get("run_id") or ""
+        started = task.get("started_at") or ""
+        if run_id and started >= latest_start:
+            latest = str(run_id)
+            latest_start = str(started)
+    return latest
+
+
 def update_status(instance_id: str, **fields: object) -> None:
     with _state_lock:
         state = {"updated_at": utc_now(), "tasks": {}}
@@ -351,6 +375,7 @@ def render_status() -> str:
         return "reading status...\n"
     tasks = state.get("tasks") or {}
     activity = load_activity()
+    run_id = current_run_id(state)
     running = []
     failed = []
     success = 0
@@ -362,7 +387,8 @@ def render_status() -> str:
         elif outcome == "failed":
             failed.append((instance_id, task))
         elif outcome == "success":
-            success += 1
+            if task.get("run_id") == run_id:
+                success += 1
             if not task.get("uploaded"):
                 pending_upload += 1
     running.sort(key=lambda item: (item[1].get("started_at") or "", item[0]), reverse=True)

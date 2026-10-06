@@ -29,6 +29,7 @@ from records import (
     mark_running_interrupted,
     render_status,
     reset_tasks,
+    set_current_run,
     store_side,
     task_outcome,
     task_record_path,
@@ -352,6 +353,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"nothing to run, skipped {skipped} success  status={HARNESS_STATE}")
         return 1 if upload_failures else 0
     print(f"run {len(pending)}, backfill {len(backfill)}, skipped {skipped} success", flush=True)
+    set_current_run(run_id)
     relay.set_activity_path(RUNS / "_harness" / "relay.json")
     relay_server = relay.start_relay(slots=args.concurrency * 2)
     catalog = build_catalog({row["instance_id"] for row in pending})
