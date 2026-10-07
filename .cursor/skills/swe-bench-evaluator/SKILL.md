@@ -24,26 +24,26 @@ The only input is an `instance_id`. Do not ask the user for the prompt, the patc
 
 Read:
 
-`G:\Code\Work\GSB\runs\<instance_id>\task.json`
+`GSB\runs\<instance_id>\task.json`
 
 Take `problem_statement`, `base_commit`, `test_cmd`, and `sides.a` / `sides.b` from that file. Do not search `candidates-3000.jsonl` or any SWE-bench dataset. There is no reference patch. Do not grade either side by similarity to some other fix.
 
 Worktrees:
 
-- A: `G:\Code\Work\GSB\task\<instance_id>\a`
-- B: `G:\Code\Work\GSB\task\<instance_id>\b`
+- A: `GSB\task\<instance_id>\a`
+- B: `GSB\task\<instance_id>\b`
 
 Trajectories, when the process must be judged. Read the plain-text session log, not the rollout JSONL:
 
-- `G:\Code\Work\GSB\runs\<instance_id>\logs\a.log`
-- `G:\Code\Work\GSB\runs\<instance_id>\logs\b.log`
+- `GSB\runs\<instance_id>\logs\a.log`
+- `GSB\runs\<instance_id>\logs\b.log`
 
 `artifacts\a-rollout.jsonl` and `artifacts\b-rollout.jsonl` are the same session as raw events. Do not parse them and do not write a script to read them. Open a rollout only when the matching `logs\<side>.log` is missing.
 
 Test logs, one per side. These are the re-run after the model finished, not the model's own session:
 
-- `G:\Code\Work\GSB\runs\<instance_id>\logs\a-test.log`
-- `G:\Code\Work\GSB\runs\<instance_id>\logs\b-test.log`
+- `GSB\runs\<instance_id>\logs\a-test.log`
+- `GSB\runs\<instance_id>\logs\b-test.log`
 
 Ignore `logs\a-record.log` and `logs\b-record.log`. Those are ffmpeg output from the test recording.
 
@@ -132,7 +132,7 @@ The delivery description opens with that finding in one clause. If nothing like 
 
 After the eight fields are final, and before the answer, upsert this instance into one file next to `status.json` and `sheet.csv`:
 
-`D:\Code\Work\GSB\runs\_harness\evals.json`
+`GSB\runs\_harness\evals.json`
 
 One file holds every eval. Read it first. If it is missing, start from `{"updated_at": null, "evals": {}}`. Set `updated_at` to UTC ISO-8601. Write only `evals.<instance_id>`. A re-eval overwrites that key and leaves every other instance as it is. Do not write `sheet.csv` or `task.json`.
 
