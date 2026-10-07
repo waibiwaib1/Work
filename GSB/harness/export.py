@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import csv
+import json
 import sys
 
-from paths import SHEET, SHEET_COLUMNS, snapshot_url
-from records import load_state, load_task, task_outcome, task_type_from_categories
+from paths import HARNESS_STATE, SHEET, SHEET_COLUMNS, snapshot_url
+from records import load_state, load_task, task_outcome, task_type_from_categories, utc_now, write_json
+
+EVALS = SHEET.parent / "evals.json"
+_EVAL_COLUMNS = (
+    "A-交付完整性（1-5）",
+    "A-交付完整性描述",
+    "B-交付完整性（1-5）",
+    "B-交付完整性描述",
+    "GSB 结论",
+    "GSB 理由",
+)
 
 _MACHINE_COLUMNS = (
     "User Prompt",
@@ -52,6 +63,7 @@ def build_sheet_row(row: dict) -> dict[str, str]:
     task = load_task(instance_id)
     sheet = blank_sheet_row()
     sheet["instance_id"] = instance_id
+    sheet["提交人"] = "Alex Wang"
     sheet["User Prompt"] = task.get("problem_statement") or row.get("problem_statement") or ""
     sheet["任务类型"] = task.get("task_type") or task_type_from_categories(row.get("pr_categories"))
     sheet["任务难度"] = task.get("difficulty") or "困难"
@@ -73,22 +85,64 @@ def build_sheet_row(row: dict) -> dict[str, str]:
     return sheet
 
 
-def merge_sheet_row(existing: dict[str, str], fresh: dict[str, str]) -> dict[str, str]:
+def load_eval_records() -> dict[str, dict]:
+    if not EVALS.exists():
+        return {}
+    payload = json.loads(EVALS.read_text(encoding="utf-8"))
+    records = payload.get("evals") or {}
+    return {key: value for key, value in records.items() if isinstance(value, dict)}
+
+
+def apply_eval(sheet: dict[str, str], record: dict | None) -> dict[str, str]:
+    if not record:
+        return sheet
+    for column in _EVAL_COLUMNS:
+        value = record.get(column)
+        if value is None or value == "":
+            continue
+        sheet[column] = str(value)
+    return sheet
+
+
+def merge_sheet_row(existing: dict[str, str], fresh: dict[str, str], from_eval: bool) -> dict[str, str]:
     merged = dict(fresh)
     for column in SHEET_COLUMNS:
         if column == "instance_id" or column in _MACHINE_COLUMNS:
             continue
-        merged[column] = existing.get(column) or ""
+        if from_eval and column in _EVAL_COLUMNS and fresh.get(column):
+            continue
+        merged[column] = existing.get(column) or fresh.get(column) or ""
     return merged
+
+
+def mark_uploaded(instance_ids: set[str]) -> int:
+    state = load_state()
+    tasks = state.get("tasks") or {}
+    now = utc_now()
+    marked = 0
+    for instance_id in instance_ids:
+        task = tasks.get(instance_id)
+        if not task or task.get("uploaded"):
+            continue
+        task["uploaded"] = True
+        task["uploaded_at"] = now
+        marked += 1
+    if not marked:
+        return 0
+    state["updated_at"] = now
+    write_json(HARNESS_STATE, state)
+    return marked
 
 
 def export_pending_sheet() -> tuple[int, int, list[str]]:
     """Insert success tasks that are not on the online sheet yet.
 
-    Machine columns come from task.json. Columns already filled in the csv,
-    including scores and GSB, stay as they are.
+    Machine columns come from task.json. Score columns come from evals.json
+    when that task has a record. Other columns already filled in the csv stay.
+    A task with an eval record is marked uploaded in status.json.
     """
     tasks = load_state().get("tasks") or {}
+    evals = load_eval_records()
     notes: list[str] = []
     pending: list[tuple[str, str]] = []
     for instance_id, task in tasks.items():
@@ -103,23 +157,25 @@ def export_pending_sheet() -> tuple[int, int, list[str]]:
             continue
         pending.append((str(task.get("started_at") or ""), instance_id))
     pending.sort()
-    if not pending:
-        return 0, 0, notes
-    rows = read_sheet_rows()
-    index = {row.get("instance_id"): i for i, row in enumerate(rows)}
     inserted = 0
     updated = 0
-    for _, instance_id in pending:
-        fresh = build_sheet_row({"instance_id": instance_id})
-        found = index.get(instance_id)
-        if found is None:
-            rows.append(fresh)
-            index[instance_id] = len(rows) - 1
-            inserted += 1
-            continue
-        rows[found] = merge_sheet_row(rows[found], fresh)
-        updated += 1
-    write_sheet_rows(rows)
+    if pending:
+        rows = read_sheet_rows()
+        index = {row.get("instance_id"): i for i, row in enumerate(rows)}
+        for _, instance_id in pending:
+            fresh = apply_eval(build_sheet_row({"instance_id": instance_id}), evals.get(instance_id))
+            found = index.get(instance_id)
+            if found is None:
+                rows.append(fresh)
+                index[instance_id] = len(rows) - 1
+                inserted += 1
+                continue
+            rows[found] = merge_sheet_row(rows[found], fresh, instance_id in evals)
+            updated += 1
+        write_sheet_rows(rows)
+    marked = mark_uploaded(set(evals) & set(tasks))
+    if marked:
+        notes.append(f"uploaded {marked}")
     return inserted, updated, notes
 
 
