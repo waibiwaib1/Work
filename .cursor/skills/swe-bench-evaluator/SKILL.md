@@ -40,7 +40,7 @@ Trajectories, when the process must be judged. Read the plain-text session log, 
 
 `artifacts\a-rollout.jsonl` and `artifacts\b-rollout.jsonl` are the same session as raw events. Do not parse them and do not write a script to read them. Open a rollout only when the matching `logs\<side>.log` is missing.
 
-Test logs, one per side. These are the harness re-run after the model finished, not the model's own session:
+Test logs, one per side. These are the re-run after the model finished, not the model's own session:
 
 - `G:\Code\Work\GSB\runs\<instance_id>\logs\a-test.log`
 - `G:\Code\Work\GSB\runs\<instance_id>\logs\b-test.log`
@@ -54,7 +54,7 @@ If `task.json` is missing, stop and say so. If one worktree is missing, still sc
 Do not lower a score or cite these in the reason:
 
 - Wall-clock time, token count, or how long the model thought
-- A run that stops with no error message (harness or deploy cut-off)
+- A run that stops with no error message (the run was cut off)
 - Network failures, HTTP errors, rate limits, or other request failures
 
 Judge model behavior and the code it left behind.
@@ -128,9 +128,44 @@ The delivery description opens with that finding in one clause. If nothing like 
 - Use process only as a tie-break when the delivery scores are equal and the product gaps do not already decide it.
 - `Same` is only for a real tie. The reason must say which points are equivalent and which trade off against each other. A one-line Same is not allowed.
 
+### 7. Write the result
+
+After the eight fields are final, and before the answer, upsert this instance into one file next to `status.json` and `sheet.csv`:
+
+`D:\Code\Work\GSB\runs\_harness\evals.json`
+
+One file holds every eval. Read it first. If it is missing, start from `{"updated_at": null, "evals": {}}`. Set `updated_at` to UTC ISO-8601. Write only `evals.<instance_id>`. A re-eval overwrites that key and leaves every other instance as it is. Do not write `sheet.csv` or `task.json`.
+
+Scores are integers from 1 to 5. `GSB 结论` is exactly `A 更好`, `Same`, or `B 更好`. The strings are the same text as the eight fields, not a second rewrite. If a side could not be scored, leave that side's three fields null and still write the file. Do not invent a score.
+
+```json
+{
+  "instance_id": "<instance_id>",
+  "evaluated_at": "<UTC ISO-8601>",
+  "A-测试结论": "<same text as the field>",
+  "A-交付完整性（1-5）": 4,
+  "A-交付完整性描述": "<same text as the field>",
+  "B-测试结论": "<same text as the field>",
+  "B-交付完整性（1-5）": 2,
+  "B-交付完整性描述": "<same text as the field>",
+  "GSB 结论": "A 更好",
+  "GSB 理由": "<same text as the field>"
+}
+```
+
+Do not mention this file after the eight fields.
+
+The batch script downloads the diff, sends the prompt, deletes the diff, and writes this file. When the prompt says the caller saves the JSON, return one JSON object and do not write the file yourself.
+
 ## How the fields are written
 
 Write names as plain text. Do not wrap file names, functions, commands, or errors in backticks, single quotes, or 「」. Do not paste a quoted error line.
+
+Do not write harness. The test log is the run in the task environment after the edit. Call that 运行环境, for example 运行环境没加载到补丁. Do not call it 复现.
+
+The party that changed the code is 模型 or AI. Do not name that party by the runner, the session, or a product name.
+
+When the model said its own tests passed and the 运行环境 run did not, say that in plain words: 与模型宣称的全部通过不一致. Do not turn that gap into a slogan. A line that fails: 与 session 里宣称的全绿不一致.
 
 `A-交付完整性（1-5）` and `B-交付完整性（1-5）` are a single integer, 1 through 5, with no other words.
 
